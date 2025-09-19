@@ -5,7 +5,7 @@
   "type": "module",
   "engines": { "node": ">=18" },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p worker/tsconfig.json",
     "start": "node dist/worker/index.js"
   },
   "dependencies": {
