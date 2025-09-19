@@ -3,15 +3,20 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
   "scripts": {
-    "build": "tsc -p worker/tsconfig.json",
-    "start": "node dist/worker/index.js"
+    "start": "tsx worker/index.ts",
+    "dev": "tsx watch worker/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "^2.45.0",
+    "cross-fetch": "^4.0.0"
   },
   "devDependencies": {
+    "tsx": "^4.17.0",
     "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
