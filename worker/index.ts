@@ -1,4 +1,4 @@
-// worker.mjs (Node 18+)
+// worker/index.ts (Node 18+)
 import { createClient } from '@supabase/supabase-js';
 
 // envs
