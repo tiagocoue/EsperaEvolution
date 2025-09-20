@@ -111,7 +111,22 @@ async function evoSend(
     const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) };
     const { filename, mimetype } = inferFilenameAndMime(media);
 
-    // 1) PTT verdadeiro (voice note): sendVoice tentando audio -> media -> base64
+    // 0) PTT nativo (documentado): sendWhatsAppAudio { number, audio, delay? }
+    {
+      const r0 = await evoPostRaw(`/message/sendWhatsAppAudio/${instance}`, {
+        number: num,
+        audio: media,             // aceita URL pública ou data URI base64
+        ...(payload.delay ? { delay: payload.delay } : {}),
+      });
+      if (r0.ok) return r0.json().catch(()=> ({}));
+      if (![400, 404].includes(r0.status)) {
+        const t = await r0.text().catch(()=> '');
+        console.error('[evolution][sendWhatsAppAudio] non-4xx', r0.status, t);
+        throw new Error(`[evolution] sendWhatsAppAudio ${r0.status} ${t}`);
+      }
+    }
+
+    // 1) PTT (voice note) legado: sendVoice tentando audio -> media -> base64
     {
       let r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype });
       if (r.ok) return r.json().catch(()=> ({}));
