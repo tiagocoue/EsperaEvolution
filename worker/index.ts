@@ -1,17 +1,7 @@
 // worker/index.ts
-// Node 18+
-// - Envia mensagens via Evolution API
-// - Consome jobs da tabela fluxo_agendamentos
-// - Fallback: tenta instance_id e, se falhar, tenta instance_name
-// - Resgata jobs "running" travados (locked_at antigo)
-// - Backoff com jitter e retries
-
 import { createClient } from '@supabase/supabase-js';
-import fetch from 'cross-fetch'; // garante fetch em runtimes que exigem polyfill
+import fetch from 'cross-fetch';
 
-// ===== ENV =====
-// Mantive NEXT_PUBLIC_SUPABASE_URL para compat com sua infra atual.
-// (Se quiser, troque para SUPABASE_URL em todo o projeto e no painel.)
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const EVO_BASE = (process.env.EVOLUTION_API_URL || process.env.EVOLUTION_API || '').replace(/\/+$/, '');
@@ -55,8 +45,20 @@ async function evoSend(kind: 'text'|'image'|'audio', instance: string, number: s
   return res.json().catch(() => ({}));
 }
 
+// >>> NOVO: presença/typing (ajuste o endpoint se sua Evolution usar outro caminho/campo)
+async function evoSendPresence(instance: string, number: string, state: 'composing'|'paused') {
+  const headers = { 'Content-Type': 'application/json', apikey: EVO_KEY as string };
+  const body = JSON.stringify({ number, presence: state });
+  const res = await fetch(`${EVO_BASE}/chat/sendPresence/${instance}`, { method: 'POST', headers, body });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`[evolution] presence ${res.status} ${text}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
 /** Tenta pelo instance_id; se falhar, tenta instance_name */
-async function evoSendWithFallback(kind: 'text'|'image'|'audio', job: any, number: string, payload: any) {
+async function evoSendWithFallback(kind: 'text'|'image'|'audio'|'presence', job: any, number: string, payload: any) {
   const attempts: string[] = [];
   if (job.instance_id) attempts.push(job.instance_id);
   if (job.instance_name) attempts.push(job.instance_name);
@@ -64,29 +66,23 @@ async function evoSendWithFallback(kind: 'text'|'image'|'audio', job: any, numbe
   let lastErr: any;
   for (const inst of attempts) {
     try {
-      return await evoSend(kind, inst, number, payload);
+      if (kind === 'presence') {
+        return await evoSendPresence(inst, number, payload.state);
+      }
+      return await evoSend(kind as any, inst, number, payload);
     } catch (e: any) {
       lastErr = e;
       console.error('[worker][evoSendWithFallback] fail for', inst, String(e));
-
-      // Se o erro for "instance does not exist" e ainda temos instance_name,
-      // podemos limpar o instance_id para os próximos retries focarem no name.
       const msg = String(e ?? '');
       if (/instance does not exist/i.test(msg) && job.instance_name && inst === job.instance_id) {
-        await supa
-          .from('fluxo_agendamentos')
-          .update({ instance_id: null })
-          .eq('id', job.id);
+        await supa.from('fluxo_agendamentos').update({ instance_id: null }).eq('id', job.id);
       }
-      // tenta a próxima estratégia
     }
   }
   throw lastErr ?? new Error('Sem instance_id/instance_name válidos');
 }
 
 // ===== Jobs =====
-
-/** Reabre jobs "running" travados há mais de N ms */
 async function rescueStaleRunning(ms = 2 * 60_000) {
   const staleIso = new Date(Date.now() - ms).toISOString();
   const { error } = await supa
@@ -97,14 +93,10 @@ async function rescueStaleRunning(ms = 2 * 60_000) {
   if (error) console.error('[rescueStaleRunning] error:', error);
 }
 
-/** Busca jobs pendentes vencidos e tenta "travar" com update atômico */
 async function claimJobs(limit = 10) {
   const nowIso = new Date().toISOString();
-
-  // 1) resgata "running" travados
   await rescueStaleRunning(2 * 60_000);
 
-  // 2) pega candidatos pendentes vencidos
   const { data: candidates, error: selErr } = await supa
     .from('fluxo_agendamentos')
     .select('id')
@@ -119,7 +111,6 @@ async function claimJobs(limit = 10) {
   }
   if (!candidates?.length) return [];
 
-  // 3) tenta travar cada um (atômico)
   const claimed: any[] = [];
   for (const c of candidates) {
     const { data: updated, error: updErr } = await supa
@@ -142,20 +133,22 @@ async function processJob(job: any) {
   try {
     if (!number) throw new Error('sem remote_jid');
 
-    // Envia com fallback (ID → NAME)
+    // presence/text/image/audio com fallback
     await evoSendWithFallback(job.action_kind as any, job, number, payload);
 
-    // (opcional) registrar em mensagens como 'enviada'
-    await supa.from('mensagens').insert({
-      whatsapp_conexao_id: job.whatsapp_conexao_id,
-      fluxo_id: job.fluxo_id,
-      user_id: job.user_id,
-      de: null,
-      para: number,
-      direcao: 'enviada',
-      conteudo: payload,
-      timestamp: new Date().toISOString(),
-    });
+    // registra em mensagens apenas quando for envio de conteúdo (não presence)
+    if (job.action_kind !== 'presence') {
+      await supa.from('mensagens').insert({
+        whatsapp_conexao_id: job.whatsapp_conexao_id,
+        fluxo_id: job.fluxo_id,
+        user_id: job.user_id,
+        de: null,
+        para: number,
+        direcao: 'enviada',
+        conteudo: payload,
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     await supa.from('fluxo_agendamentos')
       .update({ status: 'done', last_error: null })
@@ -166,7 +159,6 @@ async function processJob(job: any) {
     const max = job.max_attempts ?? 5;
 
     if (attempts < max) {
-      // backoff com jitter
       const base = 10_000 * attempts;
       const jitter = Math.floor(Math.random() * 3_000);
       const next = new Date(Date.now() + base + jitter).toISOString();
@@ -193,7 +185,6 @@ async function processJob(job: any) {
 
 // ===== Loop =====
 let running = true;
-
 process.on('SIGTERM', () => { running = false; console.log('[worker] SIGTERM recebido, finalizando…'); });
 process.on('SIGINT', () => { running = false; console.log('[worker] SIGINT recebido, finalizando…'); });
 
@@ -209,7 +200,7 @@ async function loop() {
   } catch (e) {
     console.error('[worker][loop error]', e);
   } finally {
-    if (running) setTimeout(loop, 1000); // 1s
+    if (running) setTimeout(loop, 1000);
     else process.exit(0);
   }
 }
