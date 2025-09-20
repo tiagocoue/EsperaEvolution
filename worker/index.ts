@@ -41,46 +41,45 @@ async function evoPostJson(path: string, body: Record<string, unknown>) {
   return res.json().catch(()=> ({}));
 }
 
-function isBase64DataUri(s?: string) {
-  return typeof s === 'string' && s.startsWith('data:');
-}
-
 function inferFilenameAndMime(media: string): { filename: string; mimetype: string } {
-  if (isBase64DataUri(media)) {
-    const m = /^data:([^;]+);base64,/.exec(media);
-    const mime = m?.[1] ?? 'audio/ogg';
-    const ext = mime.split('/')[1] || 'ogg';
-    return { filename: `audio.${ext}`, mimetype: mime };
-  }
   try {
     const u = new URL(media);
-    const name = u.pathname.split('/').pop() || 'audio.ogg';
+    const name = u.pathname.split('/').pop() || 'file.bin';
     const lower = name.toLowerCase();
     if (lower.endsWith('.mp3')) return { filename: name, mimetype: 'audio/mpeg' };
     if (lower.endsWith('.wav')) return { filename: name, mimetype: 'audio/wav' };
     if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return { filename: name, mimetype: 'audio/ogg' };
-    return { filename: name, mimetype: 'audio/ogg' };
+    return { filename: name, mimetype: 'application/octet-stream' };
   } catch {
-    return { filename: 'audio.ogg', mimetype: 'audio/ogg' };
+    return { filename: 'file.bin', mimetype: 'application/octet-stream' };
   }
 }
 
 /* =========================
-   EVO SEND (com fallback para áudio)
+   EVO SEND (texto, imagem, áudio/PTT, presence no-op)
    ========================= */
-async function evoSend(kind: 'text'|'image'|'audio'|'presence',
-                       instance: string,
-                       number: string,
-                       payload: any) {
+type SendKind = 'text' | 'image' | 'audio' | 'presence';
+
+async function evoSend(
+  kind: SendKind,
+  instance: string,
+  number: string,
+  payload: Record<string, any>
+) {
   const num = normalizeNumber(number);
 
   if (kind === 'text') {
-    return evoPostJson(`/message/sendText/${instance}`, { number: num, text: payload.text });
+    const body = { number: num, text: payload.text, ...(payload.delay ? { delay: payload.delay } : {}) };
+    return evoPostJson(`/message/sendText/${instance}`, body);
   }
 
   if (kind === 'image') {
-    const base = { number: num, ...(payload.caption ? { caption: payload.caption } : {}) };
-    const body = isBase64DataUri(payload.media)
+    const base = {
+      number: num,
+      ...(payload.caption ? { caption: payload.caption } : {}),
+      ...(payload.delay ? { delay: payload.delay } : {}),
+    };
+    const body = typeof payload.media === 'string' && payload.media.startsWith('data:')
       ? { ...base, base64: payload.media }
       : { ...base, url: payload.media };
     return evoPostJson(`/message/sendImage/${instance}`, body);
@@ -88,56 +87,44 @@ async function evoSend(kind: 'text'|'image'|'audio'|'presence',
 
   if (kind === 'presence') {
     // opcional: se sua versão suportar Presence; se não, ignore silenciosamente
-    // Aqui só retornamos ok para não quebrar o fluxo
     return { ok: true, skipped: 'presence' };
   }
 
   if (kind === 'audio') {
     const media: string = payload.media;
-    const base = { number: num };
+    const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) };
+    const { filename, mimetype } = inferFilenameAndMime(media);
 
-    // 1) tentar sendAudio
+    // 1) PTT verdadeiro (voice note): sendVoice com campo "audio"
     {
-      const body1 = isBase64DataUri(media) ? { ...base, base64: media } : { ...base, url: media };
-      const res1 = await evoPostRaw(`/message/sendAudio/${instance}`, body1);
+      const res1 = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype });
       if (res1.ok) return res1.json().catch(()=> ({}));
-      if (res1.status !== 404) {
-        throw new Error(`[evolution] audio ${res1.status} ${await res1.text().catch(()=> '')}`);
+      if (![400, 404].includes(res1.status)) {
+        throw new Error(`[evolution] sendVoice ${res1.status} ${await res1.text().catch(()=> '')}`);
       }
     }
 
-    // 2) tentar sendVoice (PTT) — primeiro com "media"
+    // 2) Áudio comum: sendAudio com "audio"
     {
-      const body2a = isBase64DataUri(media) ? { ...base, base64: media } : { ...base, media };
-      let res2 = await evoPostRaw(`/message/sendVoice/${instance}`, body2a);
+      const res2 = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype });
       if (res2.ok) return res2.json().catch(()=> ({}));
-
-      // alguns servers exigem "audio" ao invés de "media"
-      if (res2.status === 400 || res2.status === 422) {
-        const body2b = isBase64DataUri(media) ? { ...base, audio: media } : { ...base, audio: media };
-        res2 = await evoPostRaw(`/message/sendVoice/${instance}`, body2b);
-        if (res2.ok) return res2.json().catch(()=> ({}));
-        if (res2.status !== 404) {
-          throw new Error(`[evolution] voice ${res2.status} ${await res2.text().catch(()=> '')}`);
-        }
-      } else if (res2.status !== 404) {
-        throw new Error(`[evolution] voice ${res2.status} ${await res2.text().catch(()=> '')}`);
+      if (![400, 404].includes(res2.status)) {
+        throw new Error(`[evolution] sendAudio ${res2.status} ${await res2.text().catch(()=> '')}`);
       }
     }
 
-    // 3) fallback genérico: sendFile
+    // 3) Fallback como documento
     {
-      const { filename, mimetype } = inferFilenameAndMime(media);
-      const base3: Record<string, unknown> = { number: num, filename, mimetype, caption: '' };
-
-      const body3 = isBase64DataUri(media)
-        ? { ...base3, base64: media }
-        : { ...base3, url: media, media };
-
-      const res3 = await evoPostRaw(`/message/sendFile/${instance}`, body3);
+      const res3 = await evoPostRaw(`/message/sendMedia/${instance}`, {
+        ...base,
+        media,
+        mimetype,
+        mediatype: 'document',
+        fileName: filename,
+        caption: '',
+      });
       if (res3.ok) return res3.json().catch(()=> ({}));
-
-      throw new Error(`[evolution] file ${res3.status} ${await res3.text().catch(()=> '')}`);
+      throw new Error(`[evolution] sendMedia ${res3.status} ${await res3.text().catch(()=> '')}`);
     }
   }
 
@@ -149,7 +136,7 @@ async function evoSend(kind: 'text'|'image'|'audio'|'presence',
    ========================= */
 async function claimJobs(limit = 10) {
   const nowIso = new Date().toISOString();
-  const { data: candidates } = await supa
+  const { data: candidates, error } = await supa
     .from('fluxo_agendamentos')
     .select('id')
     .eq('status', 'pending')
@@ -157,11 +144,15 @@ async function claimJobs(limit = 10) {
     .order('due_at', { ascending: true })
     .limit(limit);
 
+  if (error) {
+    console.error('[worker][claimJobs] supabase error', error);
+    return [];
+  }
   if (!candidates?.length) return [];
 
   const claimed: any[] = [];
   for (const c of candidates) {
-    const { data: updated } = await supa
+    const { data: updated, error: upErr } = await supa
       .from('fluxo_agendamentos')
       .update({ status: 'running', locked_at: new Date().toISOString(), locked_by: WORKER_ID })
       .eq('id', c.id)
@@ -169,6 +160,10 @@ async function claimJobs(limit = 10) {
       .select('*')
       .maybeSingle();
 
+    if (upErr) {
+      console.error('[worker][claimJobs] update error', upErr);
+      continue;
+    }
     if (updated) claimed.push(updated);
   }
   return claimed;
@@ -182,7 +177,7 @@ async function processJob(job: any) {
     const number = job.remote_jid;
     const payload = job.payload || {};
 
-    await evoSend(job.action_kind, instance, number, payload);
+    await evoSend(job.action_kind as SendKind, instance, number, payload);
 
     // log opcional
     await supa.from('mensagens').insert({
