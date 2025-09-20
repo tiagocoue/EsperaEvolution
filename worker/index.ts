@@ -72,7 +72,7 @@ function guessMimeFromDataUri(dataUri: string): string {
 }
 
 /* =========================
-   EVO SEND (texto, imagem, áudio/PTT, presence no-op)
+   EVO SEND (texto, imagem, áudio/PTT, presence)
    ========================= */
 type SendKind = 'text' | 'image' | 'audio' | 'presence';
 
@@ -102,8 +102,17 @@ async function evoSend(
   }
 
   if (kind === 'presence') {
-    // opcional: se sua versão suportar Presence; se não, ignore silenciosamente
-    return { ok: true, skipped: 'presence' };
+    // Agora enviando presença de verdade (digitando/gravando)
+    const presence = payload.state === 'recording' ? 'recording' : 'composing';
+    const duration = Math.max(0, Math.min(60000, Number(payload.durationMs ?? 3000))); // 0..60s
+    const body = {
+      number: num,
+      options: {
+        presence,       // "composing" (digitando) | "recording" (gravando)
+        delay: duration // duração em ms
+      }
+    };
+    return evoPostJson(`/chat/sendPresence/${instance}`, body);
   }
 
   if (kind === 'audio') {
