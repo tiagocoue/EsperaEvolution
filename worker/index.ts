@@ -11,6 +11,12 @@ const EVO_KEY = process.env.EVOLUTION_API_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !EVO_BASE || !EVO_KEY) {
   console.error('[worker] missing env vars');
+  console.error({
+    SUPABASE_URL: !!SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: !!SUPABASE_SERVICE_ROLE_KEY,
+    EVO_BASE: !!EVO_BASE,
+    EVO_KEY: !!EVO_KEY,
+  });
   process.exit(1);
 }
 
@@ -41,6 +47,10 @@ async function evoPostJson(path: string, body: Record<string, unknown>) {
   return res.json().catch(()=> ({}));
 }
 
+function isDataUri(s: string) {
+  return typeof s === 'string' && s.startsWith('data:');
+}
+
 function inferFilenameAndMime(media: string): { filename: string; mimetype: string } {
   try {
     const u = new URL(media);
@@ -51,8 +61,14 @@ function inferFilenameAndMime(media: string): { filename: string; mimetype: stri
     if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return { filename: name, mimetype: 'audio/ogg' };
     return { filename: name, mimetype: 'application/octet-stream' };
   } catch {
-    return { filename: 'file.bin', mimetype: 'application/octet-stream' };
+    // data URI ou string sem URL válida
+    return { filename: 'audio.ogg', mimetype: isDataUri(media) ? guessMimeFromDataUri(media) : 'audio/ogg' };
   }
+}
+
+function guessMimeFromDataUri(dataUri: string): string {
+  const m = /^data:([^;]+);base64,/.exec(dataUri);
+  return m?.[1] || 'audio/ogg';
 }
 
 /* =========================
@@ -79,7 +95,7 @@ async function evoSend(
       ...(payload.caption ? { caption: payload.caption } : {}),
       ...(payload.delay ? { delay: payload.delay } : {}),
     };
-    const body = typeof payload.media === 'string' && payload.media.startsWith('data:')
+    const body = isDataUri(payload.media)
       ? { ...base, base64: payload.media }
       : { ...base, url: payload.media };
     return evoPostJson(`/message/sendImage/${instance}`, body);
@@ -95,27 +111,49 @@ async function evoSend(
     const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) };
     const { filename, mimetype } = inferFilenameAndMime(media);
 
-    // 1) PTT verdadeiro (voice note): sendVoice com campo "audio"
+    // 1) PTT verdadeiro (voice note): sendVoice tentando audio -> media -> base64
     {
-      const res1 = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype });
-      if (res1.ok) return res1.json().catch(()=> ({}));
-      if (![400, 404].includes(res1.status)) {
-        throw new Error(`[evolution] sendVoice ${res1.status} ${await res1.text().catch(()=> '')}`);
+      let r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype });
+      if (r.ok) return r.json().catch(()=> ({}));
+      if (![400, 404].includes(r.status)) {
+        const t = await r.text().catch(()=> '');
+        console.error('[evolution][sendVoice][audio] non-4xx', r.status, t);
+        throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+      }
+
+      r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, media: media, mimetype });
+      if (r.ok) return r.json().catch(()=> ({}));
+      if (![400, 404].includes(r.status)) {
+        const t = await r.text().catch(()=> '');
+        console.error('[evolution][sendVoice][media] non-4xx', r.status, t);
+        throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+      }
+
+      if (isDataUri(media)) {
+        r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, base64: media, mimetype });
+        if (r.ok) return r.json().catch(()=> ({}));
+        if (![400, 404].includes(r.status)) {
+          const t = await r.text().catch(()=> '');
+          console.error('[evolution][sendVoice][base64] non-4xx', r.status, t);
+          throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+        }
       }
     }
 
-    // 2) Áudio comum: sendAudio com "audio"
+    // 2) Áudio comum (com ptt: true para alguns servidores)
     {
-      const res2 = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype });
-      if (res2.ok) return res2.json().catch(()=> ({}));
-      if (![400, 404].includes(res2.status)) {
-        throw new Error(`[evolution] sendAudio ${res2.status} ${await res2.text().catch(()=> '')}`);
+      const r = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype, ptt: true });
+      if (r.ok) return r.json().catch(()=> ({}));
+      if (![400, 404].includes(r.status)) {
+        const t = await r.text().catch(()=> '');
+        console.error('[evolution][sendAudio][audio+ptt] non-4xx', r.status, t);
+        throw new Error(`[evolution] sendAudio ${r.status} ${t}`);
       }
     }
 
-    // 3) Fallback como documento
+    // 3) Fallback como documento (vai chegar como arquivo)
     {
-      const res3 = await evoPostRaw(`/message/sendMedia/${instance}`, {
+      const r = await evoPostRaw(`/message/sendMedia/${instance}`, {
         ...base,
         media,
         mimetype,
@@ -123,8 +161,10 @@ async function evoSend(
         fileName: filename,
         caption: '',
       });
-      if (res3.ok) return res3.json().catch(()=> ({}));
-      throw new Error(`[evolution] sendMedia ${res3.status} ${await res3.text().catch(()=> '')}`);
+      if (r.ok) return r.json().catch(()=> ({}));
+      const t = await r.text().catch(()=> '');
+      console.error('[evolution][sendMedia][document] failed', r.status, t);
+      throw new Error(`[evolution] sendMedia ${r.status} ${t}`);
     }
   }
 
