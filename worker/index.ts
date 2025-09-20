@@ -20,7 +20,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !EVO_BASE || !EVO_KEY) {
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { global: { fetch } });
 const WORKER_ID = `worker-${Math.random().toString(36).slice(2, 8)}`;
 
-// ===== Evolution API =====
+// ========= Evolution API =========
 async function evoSend(kind: 'text'|'image'|'audio', instance: string, number: string, payload: any) {
   const headers = { 'Content-Type': 'application/json', apikey: EVO_KEY as string };
   let path = '';
@@ -45,11 +45,21 @@ async function evoSend(kind: 'text'|'image'|'audio', instance: string, number: s
   return res.json().catch(() => ({}));
 }
 
-// >>> NOVO: presença/typing (ajuste o endpoint se sua Evolution usar outro caminho/campo)
-async function evoSendPresence(instance: string, number: string, state: 'composing'|'paused') {
+// presence v2.3.1: options.presence + options.delay (ms)
+async function evoSendPresence(instance: string, number: string, presence: 'composing'|'recording', delayMs?: number) {
   const headers = { 'Content-Type': 'application/json', apikey: EVO_KEY as string };
-  const body = JSON.stringify({ number, presence: state });
-  const res = await fetch(`${EVO_BASE}/chat/sendPresence/${instance}`, { method: 'POST', headers, body });
+  const body = {
+    number,
+    options: {
+      presence,                       // "composing" ou "recording"
+      ...(typeof delayMs === 'number' && delayMs > 0 ? { delay: delayMs } : {})
+    }
+  };
+  const res = await fetch(`${EVO_BASE}/chat/sendPresence/${instance}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`[evolution] presence ${res.status} ${text}`);
@@ -67,7 +77,9 @@ async function evoSendWithFallback(kind: 'text'|'image'|'audio'|'presence', job:
   for (const inst of attempts) {
     try {
       if (kind === 'presence') {
-        return await evoSendPresence(inst, number, payload.state);
+        const presence = payload.state === 'recording' ? 'recording' : 'composing';
+        const durationMs = typeof payload.durationMs === 'number' ? payload.durationMs : undefined;
+        return await evoSendPresence(inst, number, presence, durationMs);
       }
       return await evoSend(kind as any, inst, number, payload);
     } catch (e: any) {
@@ -82,7 +94,7 @@ async function evoSendWithFallback(kind: 'text'|'image'|'audio'|'presence', job:
   throw lastErr ?? new Error('Sem instance_id/instance_name válidos');
 }
 
-// ===== Jobs =====
+// ========= Jobs =========
 async function rescueStaleRunning(ms = 2 * 60_000) {
   const staleIso = new Date(Date.now() - ms).toISOString();
   const { error } = await supa
@@ -133,10 +145,8 @@ async function processJob(job: any) {
   try {
     if (!number) throw new Error('sem remote_jid');
 
-    // presence/text/image/audio com fallback
     await evoSendWithFallback(job.action_kind as any, job, number, payload);
 
-    // registra em mensagens apenas quando for envio de conteúdo (não presence)
     if (job.action_kind !== 'presence') {
       await supa.from('mensagens').insert({
         whatsapp_conexao_id: job.whatsapp_conexao_id,
@@ -183,7 +193,7 @@ async function processJob(job: any) {
   }
 }
 
-// ===== Loop =====
+// ========= Loop =========
 let running = true;
 process.on('SIGTERM', () => { running = false; console.log('[worker] SIGTERM recebido, finalizando…'); });
 process.on('SIGINT', () => { running = false; console.log('[worker] SIGINT recebido, finalizando…'); });
