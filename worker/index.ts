@@ -275,11 +275,13 @@ async function claimJobs(limit = 10) {
 
 async function processJob(job: any) {
   try {
-    const instance = (job.instance_name || job.instance_id);
+    const instance = (job.instance_id || job.instance_name);
+
     if (!instance) throw new Error('sem instance_id/name');
 
     const number = job.remote_jid;
-    const payload = job.payload || {};
+    const payload = typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {});
+
 
     await evoSend(job.action_kind as SendKind, instance, number, payload);
 
