@@ -275,15 +275,36 @@ async function claimJobs(limit = 10) {
 
 async function processJob(job: any) {
   try {
-    const instance = (job.instance_id || job.instance_name);
-
-    if (!instance) throw new Error('sem instance_id/name');
-
     const number = job.remote_jid;
-    const payload = typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {});
+    // payload pode vir como string JSON
+    const payload =
+      typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {});
 
+    // tenta primeiro pelo NOME da instância, depois pelo ID (fallback)
+    const candidates = [job.instance_name, job.instance_id].filter(Boolean) as string[];
+    if (candidates.length === 0) throw new Error('sem instance_id/name');
 
-    await evoSend(job.action_kind as SendKind, instance, number, payload);
+    let sent = false;
+    let lastErr: unknown = null;
+
+    for (const inst of candidates) {
+      try {
+        await evoSend(job.action_kind as SendKind, inst, number, payload);
+        sent = true;
+        break;
+      } catch (e) {
+        lastErr = e;
+        const msg = e instanceof Error ? e.message : String(e);
+        // Se for erro claro de instância inválida/404, tenta o próximo identificador
+        if (!/instance does not exist|Cannot POST|404/.test(msg)) {
+          throw e; // erro real (payload inválido, etc.) → não adianta trocar instância
+        }
+      }
+    }
+
+    if (!sent) {
+      throw (lastErr ?? new Error('Falha ao enviar: nenhum identificador de instância válido.'));
+    }
 
     // log opcional
     await supa.from('mensagens').insert({
@@ -297,7 +318,10 @@ async function processJob(job: any) {
       timestamp: new Date().toISOString(),
     });
 
-    await supa.from('fluxo_agendamentos').update({ status: 'done', last_error: null }).eq('id', job.id);
+    await supa
+      .from('fluxo_agendamentos')
+      .update({ status: 'done', last_error: null })
+      .eq('id', job.id);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const attempts = (job.attempts ?? 0) + 1;
@@ -306,7 +330,14 @@ async function processJob(job: any) {
       const next = new Date(Date.now() + 10_000 * attempts).toISOString();
       await supa
         .from('fluxo_agendamentos')
-        .update({ status: 'pending', attempts, last_error: msg, due_at: next, locked_at: null, locked_by: null })
+        .update({
+          status: 'pending',
+          attempts,
+          last_error: msg,
+          due_at: next,
+          locked_at: null,
+          locked_by: null,
+        })
         .eq('id', job.id);
     } else {
       await supa
@@ -316,6 +347,7 @@ async function processJob(job: any) {
     }
   }
 }
+
 
 /* =========================
    LOOP
