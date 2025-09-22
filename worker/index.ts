@@ -90,16 +90,56 @@ async function evoSend(
   }
 
   if (kind === 'image') {
-    const base = {
-      number: num,
-      ...(payload.caption ? { caption: payload.caption } : {}),
-      ...(payload.delay ? { delay: payload.delay } : {}),
-    };
-    const body = isDataUri(payload.media)
-      ? { ...base, base64: payload.media }
-      : { ...base, url: payload.media };
-    return evoPostJson(`/message/sendImage/${instance}`, body);
+  const media: string = payload.media;
+  if (!media || typeof media !== 'string') {
+    throw new Error('image payload sem media (string URL ou data URI)');
   }
+
+  // Inferir mimetype e nome a partir da URL ou data URI
+  const inferImage = (m: string) => {
+    // data:image/png;base64,...
+    if (isDataUri(m)) {
+      const mm = /^data:([^;]+);base64,/i.exec(m);
+      const mime = mm?.[1] || 'image/jpeg';
+      const ext =
+        mime.endsWith('png') ? 'png' :
+        mime.endsWith('webp') ? 'webp' :
+        mime.endsWith('gif') ? 'gif' :
+        'jpg';
+      return { mimetype: mime, fileName: `image.${ext}` };
+    }
+    // URL comum
+    try {
+      const u = new URL(m);
+      const name = u.pathname.split('/').pop() || 'image.jpg';
+      const lower = name.toLowerCase();
+      const ext = lower.includes('.') ? lower.split('.').pop()! : 'jpg';
+      const mime =
+        ext === 'png' ? 'image/png' :
+        ext === 'webp' ? 'image/webp' :
+        ext === 'gif' ? 'image/gif' :
+        'image/jpeg';
+      return { mimetype: mime, fileName: lower.includes('.') ? name : `image.${ext}` };
+    } catch {
+      return { mimetype: 'image/jpeg', fileName: 'image.jpg' };
+    }
+  };
+
+  const { mimetype, fileName } = inferImage(media);
+
+  const body = {
+    number: num,
+    mediatype: 'image',     // v2.3.x exige isso
+    mimetype,
+    fileName,
+    media,                  // aceita URL pública OU data URI
+    ...(payload.caption ? { caption: payload.caption } : {}),
+    ...(payload.delay ? { delay: payload.delay } : {}),
+  };
+
+  return evoPostJson(`/message/sendMedia/${instance}`, body);
+}
+
 
   if (kind === 'presence') {
     // Agora enviando presença de verdade (digitando/gravando)
