@@ -1,80 +1,81 @@
 // worker/index.ts (Node 18+)
-import { createClient } from '@supabase/supabase-js';
+import { createClient } from '@supabase/supabase-js'
 
 /* =========================
    ENV
    ========================= */
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const EVO_BASE = (process.env.EVOLUTION_API_URL || '').replace(/\/+$/, '');
-const EVO_KEY = process.env.EVOLUTION_API_KEY;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+const EVO_BASE = (process.env.EVOLUTION_API_URL || '').replace(/\/+$/, '')
+const EVO_KEY = process.env.EVOLUTION_API_KEY
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !EVO_BASE || !EVO_KEY) {
-  console.error('[worker] missing env vars');
+  console.error('[worker] missing env vars')
   console.error({
     SUPABASE_URL: !!SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY: !!SUPABASE_SERVICE_ROLE_KEY,
     EVO_BASE: !!EVO_BASE,
     EVO_KEY: !!EVO_KEY,
-  });
-  process.exit(1);
+  })
+  process.exit(1)
 }
 
-const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const WORKER_ID = `worker-${Math.random().toString(36).slice(2, 6)}`;
+const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+const WORKER_ID = `worker-${Math.random().toString(36).slice(2, 6)}`
 
 /* =========================
    EVO HELPERS
    ========================= */
 function normalizeNumber(input?: string | null): string {
-  if (!input) return '';
-  if (input.includes('@')) return input.split('@')[0].split(':')[0];
-  return input;
+  if (!input) return ''
+  // remove JID/sufixos e tudo que não for dígito
+  const base = input.split('@')[0].split(':')[0]
+  return base.replace(/[^\d]/g, '').trim()
 }
 
 async function evoPostRaw(path: string, body: Record<string, unknown>) {
-  const url = `${EVO_BASE}${path}`;
+  const url = `${EVO_BASE}${path}`
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', apikey: EVO_KEY as string },
     body: JSON.stringify(body),
-  });
+  })
 }
 
 async function evoPostJson(path: string, body: Record<string, unknown>) {
-  const res = await evoPostRaw(path, body);
-  if (!res.ok) throw new Error(`${path} ${res.status} ${await res.text().catch(()=> '')}`);
-  return res.json().catch(()=> ({}));
+  const res = await evoPostRaw(path, body)
+  if (!res.ok) throw new Error(`${path} ${res.status} ${await res.text().catch(() => '')}`)
+  return res.json().catch(() => ({}))
 }
 
 function isDataUri(s: string) {
-  return typeof s === 'string' && s.startsWith('data:');
+  return typeof s === 'string' && s.startsWith('data:')
 }
 
 function inferFilenameAndMime(media: string): { filename: string; mimetype: string } {
   try {
-    const u = new URL(media);
-    const name = u.pathname.split('/').pop() || 'file.bin';
-    const lower = name.toLowerCase();
-    if (lower.endsWith('.mp3')) return { filename: name, mimetype: 'audio/mpeg' };
-    if (lower.endsWith('.wav')) return { filename: name, mimetype: 'audio/wav' };
-    if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return { filename: name, mimetype: 'audio/ogg' };
-    return { filename: name, mimetype: 'application/octet-stream' };
+    const u = new URL(media)
+    const name = u.pathname.split('/').pop() || 'file.bin'
+    const lower = name.toLowerCase()
+    if (lower.endsWith('.mp3')) return { filename: name, mimetype: 'audio/mpeg' }
+    if (lower.endsWith('.wav')) return { filename: name, mimetype: 'audio/wav' }
+    if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return { filename: name, mimetype: 'audio/ogg' }
+    return { filename: name, mimetype: 'application/octet-stream' }
   } catch {
     // data URI ou string sem URL válida
-    return { filename: 'audio.ogg', mimetype: isDataUri(media) ? guessMimeFromDataUri(media) : 'audio/ogg' };
+    return { filename: 'audio.ogg', mimetype: isDataUri(media) ? guessMimeFromDataUri(media) : 'audio/ogg' }
   }
 }
 
 function guessMimeFromDataUri(dataUri: string): string {
-  const m = /^data:([^;]+);base64,/.exec(dataUri);
-  return m?.[1] || 'audio/ogg';
+  const m = /^data:([^;]+);base64,/.exec(dataUri)
+  return m?.[1] || 'audio/ogg'
 }
 
 /* =========================
-   EVO SEND (texto, imagem, áudio/PTT, presence)
+   EVO SEND (texto, imagem, áudio/PTT, presence, notify)
    ========================= */
-type SendKind = 'text' | 'image' | 'audio' | 'presence';
+type SendKind = 'text' | 'image' | 'audio' | 'presence' | 'notify'
 
 async function evoSend(
   kind: SendKind,
@@ -82,83 +83,90 @@ async function evoSend(
   number: string,
   payload: Record<string, any>
 ) {
-  const num = normalizeNumber(number);
+  // para notify o destino vem do payload; para os demais, do arg number
+  const num = kind === 'notify' ? normalizeNumber(payload.number) : normalizeNumber(number)
+
+  if (kind === 'notify') {
+    const text = (payload.text ?? '').toString().trim()
+    if (!num || !text) throw new Error('notify payload inválido (number/text ausentes)')
+    const body = { number: num, text, ...(payload.delay ? { delay: payload.delay } : {}) }
+    return evoPostJson(`/message/sendText/${instance}`, body)
+  }
 
   if (kind === 'text') {
-    const body = { number: num, text: payload.text, ...(payload.delay ? { delay: payload.delay } : {}) };
-    return evoPostJson(`/message/sendText/${instance}`, body);
+    const body = { number: num, text: payload.text, ...(payload.delay ? { delay: payload.delay } : {}) }
+    return evoPostJson(`/message/sendText/${instance}`, body)
   }
 
   if (kind === 'image') {
-  const media: string = payload.media;
-  if (!media || typeof media !== 'string') {
-    throw new Error('image payload sem media (string URL ou data URI)');
+    const media: string = payload.media
+    if (!media || typeof media !== 'string') {
+      throw new Error('image payload sem media (string URL ou data URI)')
+    }
+
+    // Inferir mimetype e nome a partir da URL ou data URI
+    const inferImage = (m: string) => {
+      // data:image/png;base64,...
+      if (isDataUri(m)) {
+        const mm = /^data:([^;]+);base64,/i.exec(m)
+        const mime = mm?.[1] || 'image/jpeg'
+        const ext =
+          mime.endsWith('png') ? 'png' :
+          mime.endsWith('webp') ? 'webp' :
+          mime.endsWith('gif') ? 'gif' :
+          'jpg'
+        return { mimetype: mime, fileName: `image.${ext}` }
+      }
+      // URL comum
+      try {
+        const u = new URL(m)
+        const name = u.pathname.split('/').pop() || 'image.jpg'
+        const lower = name.toLowerCase()
+        const ext = lower.includes('.') ? lower.split('.').pop()! : 'jpg'
+        const mime =
+          ext === 'png' ? 'image/png' :
+          ext === 'webp' ? 'image/webp' :
+          ext === 'gif' ? 'image/gif' :
+          'image/jpeg'
+        return { mimetype: mime, fileName: lower.includes('.') ? name : `image.${ext}` }
+      } catch {
+        return { mimetype: 'image/jpeg', fileName: 'image.jpg' }
+      }
+    }
+
+    const { mimetype, fileName } = inferImage(media)
+
+    const body = {
+      number: num,
+      mediatype: 'image',     // v2.3.x exige isso
+      mimetype,
+      fileName,
+      media,                  // aceita URL pública OU data URI
+      ...(payload.caption ? { caption: payload.caption } : {}),
+      ...(payload.delay ? { delay: payload.delay } : {}),
+    }
+
+    return evoPostJson(`/message/sendMedia/${instance}`, body)
   }
-
-  // Inferir mimetype e nome a partir da URL ou data URI
-  const inferImage = (m: string) => {
-    // data:image/png;base64,...
-    if (isDataUri(m)) {
-      const mm = /^data:([^;]+);base64,/i.exec(m);
-      const mime = mm?.[1] || 'image/jpeg';
-      const ext =
-        mime.endsWith('png') ? 'png' :
-        mime.endsWith('webp') ? 'webp' :
-        mime.endsWith('gif') ? 'gif' :
-        'jpg';
-      return { mimetype: mime, fileName: `image.${ext}` };
-    }
-    // URL comum
-    try {
-      const u = new URL(m);
-      const name = u.pathname.split('/').pop() || 'image.jpg';
-      const lower = name.toLowerCase();
-      const ext = lower.includes('.') ? lower.split('.').pop()! : 'jpg';
-      const mime =
-        ext === 'png' ? 'image/png' :
-        ext === 'webp' ? 'image/webp' :
-        ext === 'gif' ? 'image/gif' :
-        'image/jpeg';
-      return { mimetype: mime, fileName: lower.includes('.') ? name : `image.${ext}` };
-    } catch {
-      return { mimetype: 'image/jpeg', fileName: 'image.jpg' };
-    }
-  };
-
-  const { mimetype, fileName } = inferImage(media);
-
-  const body = {
-    number: num,
-    mediatype: 'image',     // v2.3.x exige isso
-    mimetype,
-    fileName,
-    media,                  // aceita URL pública OU data URI
-    ...(payload.caption ? { caption: payload.caption } : {}),
-    ...(payload.delay ? { delay: payload.delay } : {}),
-  };
-
-  return evoPostJson(`/message/sendMedia/${instance}`, body);
-}
-
 
   if (kind === 'presence') {
     // Agora enviando presença de verdade (digitando/gravando)
-    const presence = payload.state === 'recording' ? 'recording' : 'composing';
-    const duration = Math.max(0, Math.min(60000, Number(payload.durationMs ?? 3000))); // 0..60s
+    const presence = payload.state === 'recording' ? 'recording' : 'composing'
+    const duration = Math.max(0, Math.min(60000, Number(payload.durationMs ?? 3000))) // 0..60s
     const body = {
       number: num,
       options: {
         presence,       // "composing" (digitando) | "recording" (gravando)
         delay: duration // duração em ms
       }
-    };
-    return evoPostJson(`/chat/sendPresence/${instance}`, body);
+    }
+    return evoPostJson(`/chat/sendPresence/${instance}`, body)
   }
 
   if (kind === 'audio') {
-    const media: string = payload.media;
-    const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) };
-    const { filename, mimetype } = inferFilenameAndMime(media);
+    const media: string = payload.media
+    const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) }
+    const { filename, mimetype } = inferFilenameAndMime(media)
 
     // 0) PTT nativo (documentado): sendWhatsAppAudio { number, audio, delay? }
     {
@@ -166,52 +174,52 @@ async function evoSend(
         number: num,
         audio: media,             // aceita URL pública ou data URI base64
         ...(payload.delay ? { delay: payload.delay } : {}),
-      });
-      if (r0.ok) return r0.json().catch(()=> ({}));
+      })
+      if (r0.ok) return r0.json().catch(() => ({}))
       if (![400, 404].includes(r0.status)) {
-        const t = await r0.text().catch(()=> '');
-        console.error('[evolution][sendWhatsAppAudio] non-4xx', r0.status, t);
-        throw new Error(`[evolution] sendWhatsAppAudio ${r0.status} ${t}`);
+        const t = await r0.text().catch(() => '')
+        console.error('[evolution][sendWhatsAppAudio] non-4xx', r0.status, t)
+        throw new Error(`[evolution] sendWhatsAppAudio ${r0.status} ${t}`)
       }
     }
 
     // 1) PTT (voice note) legado: sendVoice tentando audio -> media -> base64
     {
-      let r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype });
-      if (r.ok) return r.json().catch(()=> ({}));
+      let r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype })
+      if (r.ok) return r.json().catch(() => ({}))
       if (![400, 404].includes(r.status)) {
-        const t = await r.text().catch(()=> '');
-        console.error('[evolution][sendVoice][audio] non-4xx', r.status, t);
-        throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+        const t = await r.text().catch(() => '')
+        console.error('[evolution][sendVoice][audio] non-4xx', r.status, t)
+        throw new Error(`[evolution] sendVoice ${r.status} ${t}`)
       }
 
-      r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, media: media, mimetype });
-      if (r.ok) return r.json().catch(()=> ({}));
+      r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, media: media, mimetype })
+      if (r.ok) return r.json().catch(() => ({}))
       if (![400, 404].includes(r.status)) {
-        const t = await r.text().catch(()=> '');
-        console.error('[evolution][sendVoice][media] non-4xx', r.status, t);
-        throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+        const t = await r.text().catch(() => '')
+        console.error('[evolution][sendVoice][media] non-4xx', r.status, t)
+        throw new Error(`[evolution] sendVoice ${r.status} ${t}`)
       }
 
       if (isDataUri(media)) {
-        r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, base64: media, mimetype });
-        if (r.ok) return r.json().catch(()=> ({}));
+        r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, base64: media, mimetype })
+        if (r.ok) return r.json().catch(() => ({}))
         if (![400, 404].includes(r.status)) {
-          const t = await r.text().catch(()=> '');
-          console.error('[evolution][sendVoice][base64] non-4xx', r.status, t);
-          throw new Error(`[evolution] sendVoice ${r.status} ${t}`);
+          const t = await r.text().catch(() => '')
+          console.error('[evolution][sendVoice][base64] non-4xx', r.status, t)
+          throw new Error(`[evolution] sendVoice ${r.status} ${t}`)
         }
       }
     }
 
     // 2) Áudio comum (com ptt: true para alguns servidores)
     {
-      const r = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype, ptt: true });
-      if (r.ok) return r.json().catch(()=> ({}));
+      const r = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype, ptt: true })
+      if (r.ok) return r.json().catch(() => ({}))
       if (![400, 404].includes(r.status)) {
-        const t = await r.text().catch(()=> '');
-        console.error('[evolution][sendAudio][audio+ptt] non-4xx', r.status, t);
-        throw new Error(`[evolution] sendAudio ${r.status} ${t}`);
+        const t = await r.text().catch(() => '')
+        console.error('[evolution][sendAudio][audio+ptt] non-4xx', r.status, t)
+        throw new Error(`[evolution] sendAudio ${r.status} ${t}`)
       }
     }
 
@@ -224,37 +232,37 @@ async function evoSend(
         mediatype: 'document',
         fileName: filename,
         caption: '',
-      });
-      if (r.ok) return r.json().catch(()=> ({}));
-      const t = await r.text().catch(()=> '');
-      console.error('[evolution][sendMedia][document] failed', r.status, t);
-      throw new Error(`[evolution] sendMedia ${r.status} ${t}`);
+      })
+      if (r.ok) return r.json().catch(() => ({}))
+      const t = await r.text().catch(() => '')
+      console.error('[evolution][sendMedia][document] failed', r.status, t)
+      throw new Error(`[evolution] sendMedia ${r.status} ${t}`)
     }
   }
 
-  throw new Error(`[evolution] unsupported kind: ${kind}`);
+  throw new Error(`[evolution] unsupported kind: ${kind}`)
 }
 
 /* =========================
    CLAIM + PROCESS
    ========================= */
 async function claimJobs(limit = 10) {
-  const nowIso = new Date().toISOString();
+  const nowIso = new Date().toISOString()
   const { data: candidates, error } = await supa
     .from('fluxo_agendamentos')
     .select('id')
     .eq('status', 'pending')
     .lte('due_at', nowIso)
     .order('due_at', { ascending: true })
-    .limit(limit);
+    .limit(limit)
 
   if (error) {
-    console.error('[worker][claimJobs] supabase error', error);
-    return [];
+    console.error('[worker][claimJobs] supabase error', error)
+    return []
   }
-  if (!candidates?.length) return [];
+  if (!candidates?.length) return []
 
-  const claimed: any[] = [];
+  const claimed: any[] = []
   for (const c of candidates) {
     const { data: updated, error: upErr } = await supa
       .from('fluxo_agendamentos')
@@ -262,72 +270,75 @@ async function claimJobs(limit = 10) {
       .eq('id', c.id)
       .eq('status', 'pending')
       .select('*')
-      .maybeSingle();
+      .maybeSingle()
 
     if (upErr) {
-      console.error('[worker][claimJobs] update error', upErr);
-      continue;
+      console.error('[worker][claimJobs] update error', upErr)
+      continue
     }
-    if (updated) claimed.push(updated);
+    if (updated) claimed.push(updated)
   }
-  return claimed;
+  return claimed
 }
 
 async function processJob(job: any) {
   try {
-    const number = job.remote_jid;
     // payload pode vir como string JSON
     const payload =
-      typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {});
+      typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {})
+
+    // para 'notify' o destino é payload.number; para os demais, remote_jid
+    const isNotify = job.action_kind === 'notify'
+    const number = isNotify ? (payload.number ?? '') : job.remote_jid
 
     // tenta primeiro pelo NOME da instância, depois pelo ID (fallback)
-    const candidates = [job.instance_name, job.instance_id].filter(Boolean) as string[];
-    if (candidates.length === 0) throw new Error('sem instance_id/name');
+    const candidates = [job.instance_name, job.instance_id].filter(Boolean) as string[]
+    if (candidates.length === 0) throw new Error('sem instance_id/name')
 
-    let sent = false;
-    let lastErr: unknown = null;
+    let sent = false
+    let lastErr: unknown = null
 
     for (const inst of candidates) {
       try {
-        await evoSend(job.action_kind as SendKind, inst, number, payload);
-        sent = true;
-        break;
+        await evoSend(job.action_kind as SendKind, inst, number, payload)
+        sent = true
+        break
       } catch (e) {
-        lastErr = e;
-        const msg = e instanceof Error ? e.message : String(e);
+        lastErr = e
+        const msg = e instanceof Error ? e.message : String(e)
         // Se for erro claro de instância inválida/404, tenta o próximo identificador
         if (!/instance does not exist|Cannot POST|404/.test(msg)) {
-          throw e; // erro real (payload inválido, etc.) → não adianta trocar instância
+          throw e // erro real (payload inválido, etc.) → não adianta trocar instância
         }
       }
     }
 
     if (!sent) {
-      throw (lastErr ?? new Error('Falha ao enviar: nenhum identificador de instância válido.'));
+      throw (lastErr ?? new Error('Falha ao enviar: nenhum identificador de instância válido.'))
     }
 
-    // log opcional
+    // log opcional em mensagens (marca notify explicitamente)
     await supa.from('mensagens').insert({
       whatsapp_conexao_id: job.whatsapp_conexao_id,
       fluxo_id: job.fluxo_id,
       user_id: job.user_id,
       de: null,
-      para: number,
+      para: normalizeNumber(number),
       direcao: 'enviada',
-      conteudo: payload,
+      conteudo: isNotify ? { notify: true, text: payload.text } : payload,
       timestamp: new Date().toISOString(),
-    });
+    })
 
     await supa
       .from('fluxo_agendamentos')
       .update({ status: 'done', last_error: null })
-      .eq('id', job.id);
+      .eq('id', job.id)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const attempts = (job.attempts ?? 0) + 1;
+    const msg = err instanceof Error ? err.message : String(err)
+    const attempts = (job.attempts ?? 0) + 1
 
     if (attempts < (job.max_attempts ?? 5)) {
-      const next = new Date(Date.now() + 10_000 * attempts).toISOString();
+      const next = new Date(Date.now() + 10_000 * attempts).toISOString()
       await supa
         .from('fluxo_agendamentos')
         .update({
@@ -338,30 +349,29 @@ async function processJob(job: any) {
           locked_at: null,
           locked_by: null,
         })
-        .eq('id', job.id);
+        .eq('id', job.id)
     } else {
       await supa
         .from('fluxo_agendamentos')
         .update({ status: 'failed', attempts, last_error: msg })
-        .eq('id', job.id);
+        .eq('id', job.id)
     }
   }
 }
-
 
 /* =========================
    LOOP
    ========================= */
 async function loop() {
   try {
-    const jobs = await claimJobs(10);
-    for (const j of jobs) await processJob(j);
+    const jobs = await claimJobs(10)
+    for (const j of jobs) await processJob(j)
   } catch (e) {
-    console.error('[worker][loop error]', e);
+    console.error('[worker][loop error]', e)
   } finally {
-    setTimeout(loop, 1000);
+    setTimeout(loop, 1000)
   }
 }
 
-console.log(`[worker] starting ${WORKER_ID}`);
-loop();
+console.log(`[worker] starting ${WORKER_ID}`)
+loop()
