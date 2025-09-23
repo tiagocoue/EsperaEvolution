@@ -595,18 +595,72 @@ function extractFollowupText(raw: unknown): string {
   return '';
 }
 
+async function resolveInstanceAndUserForWait(wait: any): Promise<{
+  instanceId: string | null;
+  instanceName: string | null;
+  userId: string | null;
+}> {
+  // 1) Tenta pegar direto da própria linha de fluxo_esperas
+  let instanceId: string | null = wait.instance_id ?? null;
+  let instanceName: string | null = wait.instance_name ?? null;
+  let userId: string | null = wait.user_id ?? null;
+
+  if (instanceId || instanceName) {
+    return { instanceId, instanceName, userId };
+  }
+
+  // 2) Fallback: busca o ÚLTIMO job da mesma conexão + (mesmo fluxo + mesmo remote_jid)
+  //    Ajuste a chave de ordenação conforme seu schema (created_at é o mais comum)
+  const { data: lastJobs, error } = await supa
+    .from('fluxo_agendamentos')
+    .select('instance_id, instance_name, user_id')
+    .eq('whatsapp_conexao_id', wait.whatsapp_conexao_id)
+    .eq('remote_jid', wait.remote_jid)
+    .eq('fluxo_id', wait.fluxo_id)
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (!error && lastJobs?.length) {
+    instanceId = lastJobs[0]?.instance_id ?? null;
+    instanceName = lastJobs[0]?.instance_name ?? null;
+    userId = userId ?? (lastJobs[0]?.user_id ?? null);
+  }
+
+  // 3) Se ainda assim não conseguiu, tenta cair só pela conexão (sem fluxo/remote)
+  if (!instanceId && !instanceName) {
+    const { data: lastByConn, error: err2 } = await supa
+      .from('fluxo_agendamentos')
+      .select('instance_id, instance_name, user_id')
+      .eq('whatsapp_conexao_id', wait.whatsapp_conexao_id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (!err2 && lastByConn?.length) {
+      instanceId = lastByConn[0]?.instance_id ?? null;
+      instanceName = lastByConn[0]?.instance_name ?? null;
+      userId = userId ?? (lastByConn[0]?.user_id ?? null);
+    }
+  }
+
+  return { instanceId, instanceName, userId };
+}
+
+
 async function processExpiredWait(wait: any) {
   try {
-    // carrega conexão (para descobrir instance e user)
-    const { data: conn, error: connErr } = await supa
-      .from('whatsapp_conexoes')
-      .select('id, user_id, instance_id, instance_name')
-      .eq('id', wait.whatsapp_conexao_id)
-      .maybeSingle();
-    if (connErr || !conn) throw new Error('whatsapp_conexao não encontrada');
+    // Resolve instância e user sem depender de whatsapp_conexoes
+    const { instanceId, instanceName, userId } = await resolveInstanceAndUserForWait(wait);
 
-    const instanceId = conn.instance_id ?? null;
-    const instanceName = conn.instance_name ?? null;
+    if (!instanceId && !instanceName) {
+      console.error('[worker][processExpiredWait] sem instance_id/name para follow-up', {
+        espera_id: wait.id,
+        conexao: wait.whatsapp_conexao_id,
+        fluxo: wait.fluxo_id,
+        remote_jid: wait.remote_jid,
+      });
+      // Sem instância não tem o que fazer — mantemos como "expired" (ou você pode marcar como "failed" se possuir essa coluna)
+      return;
+    }
 
     // 1) follow-up (se houver)
     const follow = extractFollowupText(wait.followup_text);
@@ -614,7 +668,7 @@ async function processExpiredWait(wait: any) {
       await enqueueJob({
         conexaoId: wait.whatsapp_conexao_id,
         fluxoId: wait.fluxo_id ?? null,
-        userId: conn.user_id ?? null,
+        userId: userId ?? null,
         remoteJid: wait.remote_jid,
         instanceId,
         instanceName,
@@ -630,10 +684,12 @@ async function processExpiredWait(wait: any) {
 
     // carrega grafo do fluxo
     const [{ data: nodes }, { data: edges }] = await Promise.all([
-      supa.from('fluxo_nos')
+      supa
+        .from('fluxo_nos')
         .select('id, fluxo_id, tipo, conteudo, ordem')
         .eq('fluxo_id', wait.fluxo_id),
-      supa.from('fluxo_edge')
+      supa
+        .from('fluxo_edge')
         .select('id, fluxo_id, source, target, data')
         .eq('fluxo_id', wait.fluxo_id),
     ]);
@@ -646,13 +702,13 @@ async function processExpiredWait(wait: any) {
     );
     if (!actions.length) return;
 
-    // enfileira todas as ações
+    // enfileira todas as ações com a instância resolvida
     for (const a of actions) {
       if (a.kind === 'presence') {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
-          userId: conn.user_id ?? null,
+          userId: userId ?? null,
           remoteJid: wait.remote_jid,
           instanceId,
           instanceName,
@@ -664,7 +720,7 @@ async function processExpiredWait(wait: any) {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
-          userId: conn.user_id ?? null,
+          userId: userId ?? null,
           remoteJid: wait.remote_jid,
           instanceId,
           instanceName,
@@ -676,7 +732,7 @@ async function processExpiredWait(wait: any) {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
-          userId: conn.user_id ?? null,
+          userId: userId ?? null,
           remoteJid: wait.remote_jid,
           instanceId,
           instanceName,
@@ -688,7 +744,7 @@ async function processExpiredWait(wait: any) {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
-          userId: conn.user_id ?? null,
+          userId: userId ?? null,
           remoteJid: wait.remote_jid,
           instanceId,
           instanceName,
@@ -700,7 +756,7 @@ async function processExpiredWait(wait: any) {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
-          userId: conn.user_id ?? null,
+          userId: userId ?? null,
           remoteJid: wait.remote_jid,
           instanceId,
           instanceName,
@@ -712,9 +768,10 @@ async function processExpiredWait(wait: any) {
     }
   } catch (e) {
     console.error('[worker][processExpiredWait] error', e);
-    // opcional: marcar como failed? por enquanto fica como "expired" mesmo.
+    // Mantemos a linha como "expired" (já marcada no claim). Se você possuir coluna de erro, pode atualizar aqui.
   }
 }
+
 
 /* =========================
    LOOP
