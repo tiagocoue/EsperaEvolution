@@ -662,21 +662,7 @@ async function processExpiredWait(wait: any) {
       return;
     }
 
-    // 1) follow-up (se houver)
-    const follow = extractFollowupText(wait.followup_text);
-    if (follow) {
-      await enqueueJob({
-        conexaoId: wait.whatsapp_conexao_id,
-        fluxoId: wait.fluxo_id ?? null,
-        userId: userId ?? null,
-        remoteJid: wait.remote_jid,
-        instanceId,
-        instanceName,
-        actionKind: 'text',
-        payload: { text: follow },
-        delayMs: 0,
-      });
-    }
+   
 
     // 2) continuar o fluxo pelo no_reply_target_id
     const startId: string | null = wait.no_reply_target_id || null;
