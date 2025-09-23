@@ -73,6 +73,45 @@ function guessMimeFromDataUri(dataUri: string): string {
 }
 
 /* =========================
+   QUEUE HELPERS (fluxo_agendamentos)
+   ========================= */
+type QueueActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify';
+
+async function enqueueJob(params: {
+  conexaoId: string;
+  fluxoId: string | null;
+  userId: string | null;
+  remoteJid: string;
+  instanceId?: string | null;
+  instanceName?: string | null;
+  actionKind: QueueActionKind;
+  payload: Record<string, unknown>;
+  delayMs?: number; // default 0
+}) {
+  const {
+    conexaoId, fluxoId, userId, remoteJid,
+    instanceId, instanceName, actionKind, payload, delayMs = 0
+  } = params;
+
+  const dueAt = new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+
+  const { error } = await supa.from('fluxo_agendamentos').insert({
+    user_id: userId,
+    whatsapp_conexao_id: conexaoId,
+    fluxo_id: fluxoId,
+    remote_jid: remoteJid,
+    instance_id: instanceId ?? null,
+    instance_name: instanceName ?? null,
+    action_kind: actionKind,
+    payload,
+    due_at: dueAt,
+    status: 'pending',
+  });
+
+  if (error) throw error;
+}
+
+/* =========================
    EVO SEND (texto, imagem, áudio/PTT, presence, notify)
    ========================= */
 type SendKind = 'text' | 'image' | 'audio' | 'presence' | 'notify'
@@ -248,32 +287,6 @@ async function evoSend(
    ========================= */
 type JobActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify'
 
-async function enqueueJob(params: {
-  conexaoId: string
-  fluxoId: string | null
-  userId: string | null
-  remoteJid: string
-  instanceId?: string | null
-  instanceName?: string | null
-  actionKind: JobActionKind
-  payload: Record<string, unknown>
-  delayMs?: number
-}) {
-  const due = new Date(Date.now() + Math.max(0, Number(params.delayMs || 0)))
-  await supa.from('fluxo_agendamentos').insert({
-    user_id: params.userId,
-    whatsapp_conexao_id: params.conexaoId,
-    fluxo_id: params.fluxoId,
-    remote_jid: params.remoteJid,
-    instance_id: params.instanceId ?? null,
-    instance_name: params.instanceName ?? null,
-    action_kind: params.actionKind,
-    payload: params.payload,
-    due_at: due.toISOString(),
-    status: 'pending',
-  })
-}
-
 async function claimJobs(limit = 10) {
   const nowIso = new Date().toISOString()
   const { data: candidates, error } = await supa
@@ -353,7 +366,7 @@ async function processJob(job: any) {
       de: null,
       para: normalizeNumber(number),
       direcao: 'enviada',
-      conteudo: isNotify ? { notify: true, text: payload.text } : payload,
+      conteudo: isNotify ? { notify: true, text: (payload as any).text } : payload,
       timestamp: new Date().toISOString(),
     })
 
@@ -388,448 +401,318 @@ async function processJob(job: any) {
 }
 
 /* =========================
-   === AGUARDE === mini-planner
-   (rodar do nó target: respeita waits, envia, e para em novo aguarde)
+   MINI PLANNER p/ continuação do fluxo
    ========================= */
-
 type DbNode = {
-  id: string
-  fluxo_id: string
-  tipo: string
-  conteudo: any
-  ordem: number
-}
+  id: string;
+  fluxo_id: string;
+  tipo: 'mensagem_texto' | 'mensagem_imagem' | 'mensagem_audio' | 'mensagem_espera' | 'mensagem_notificada' | string;
+  conteudo: unknown; // jsonb
+  ordem: number;
+};
 
 type DbEdge = {
-  id: string
-  fluxo_id: string
-  source: string
-  target: string
-  data: any
-}
+  id: string;
+  fluxo_id: string;
+  source: string; // node.id (db)
+  target: string; // node.id (db)
+  data: unknown;  // jsonb com "outcome" etc (opcional)
+};
 
-function isWaitNode(n: DbNode) {
-  return n.tipo === 'mensagem_espera'
-}
-function isSendNode(n: DbNode) {
-  return n.tipo === 'mensagem_texto' || n.tipo === 'mensagem_imagem' || n.tipo === 'mensagem_audio' || n.tipo === 'mensagem_notificada'
-}
-function isAguardeNode(n: DbNode) {
-  return n.tipo === 'aguarde_resposta'
-}
+type PlannedAction =
+  | { kind: 'text'; text: string; delayMs: number }
+  | { kind: 'image'; urlOrBase64: string; caption?: string; delayMs: number }
+  | { kind: 'audio'; urlOrBase64: string; delayMs: number }
+  | { kind: 'presence'; state: 'composing' | 'recording'; durationMs?: number; delayMs: number }
+  | { kind: 'notify'; number: string; text: string; delayMs: number };
+
+const isWaitNode = (n: DbNode) => n.tipo === 'mensagem_espera';
 
 function parseWaitSeconds(node: DbNode): number {
-  const raw = node?.conteudo?.waitSeconds
-  const s = typeof raw === 'number' ? raw : Number(raw)
-  return Number.isFinite(s) && s > 0 ? Math.floor(s) : 0
+  const c = (node.conteudo ?? {}) as { waitSeconds?: unknown };
+  const raw = c.waitSeconds;
+  const s = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(s) && s > 0 ? Math.floor(s) : 0;
 }
+
 function parseText(node: DbNode): string | null {
-  const t = typeof node?.conteudo?.text === 'string' ? node.conteudo.text : null
-  return t && t.trim() ? t : null
+  const c = (node.conteudo ?? {}) as { text?: unknown };
+  const t = typeof c.text === 'string' ? c.text : null;
+  return t && t.trim() ? t : null;
 }
-function parseImage(node: DbNode): { media: string; caption?: string } | null {
-  const c = node.conteudo || {}
-  const url = typeof c.url === 'string' && c.url.trim() ? c.url.trim() : undefined
-  const b64 = typeof c.base64 === 'string' && c.base64.trim() ? c.base64.trim() : undefined
-  const data = typeof c.data === 'string' && c.data.trim() ? c.data.trim() : undefined
-  const media = b64 ?? data ?? url ?? null
-  if (!media) return null
-  const captionRaw = (typeof c.caption === 'string' ? c.caption : undefined) ?? (typeof c.text === 'string' ? c.text : undefined)
-  const caption = captionRaw && captionRaw.trim() ? captionRaw.trim() : undefined
-  return { media, caption }
+
+function parseImage(node: DbNode): { urlOrBase64: string; caption?: string } | null {
+  const c = (node.conteudo ?? {}) as {
+    url?: unknown; base64?: unknown; data?: unknown;
+    caption?: unknown; text?: unknown;
+  };
+  const url = typeof c.url === 'string' && c.url.trim() ? c.url.trim() : undefined;
+  const b64 = typeof c.base64 === 'string' && c.base64.trim() ? c.base64.trim() : undefined;
+  const data = typeof c.data === 'string' && c.data.trim() ? c.data.trim() : undefined;
+  const media = b64 ?? data ?? url ?? null;
+  if (!media) return null;
+
+  const capRaw =
+    (typeof c.caption === 'string' ? c.caption : undefined) ??
+    (typeof c.text === 'string' ? c.text : undefined);
+  const caption = capRaw && capRaw.trim() ? capRaw.trim() : undefined;
+
+  return { urlOrBase64: media, caption };
 }
-function parseAudio(node: DbNode): { media: string } | null {
-  const c = node.conteudo || {}
-  const url = typeof c.url === 'string' ? c.url : undefined
-  const b64 = typeof c.base64 === 'string' ? c.base64 : undefined
-  const media = b64 ?? url ?? null
-  return media ? { media } : null
+
+function parseAudio(node: DbNode): { urlOrBase64: string } | null {
+  const c = (node.conteudo ?? {}) as { url?: unknown; base64?: unknown };
+  const url = typeof c.url === 'string' ? c.url : undefined;
+  const b64 = typeof c.base64 === 'string' ? c.base64 : undefined;
+  const media = b64 ?? url ?? null;
+  return media ? { urlOrBase64: media } : null;
 }
+
 function parseNotify(node: DbNode): { number: string; text: string } | null {
-  const c = node.conteudo || {}
+  const c = (node.conteudo ?? {}) as { numero?: unknown; mensagem?: unknown };
   const numero =
     typeof c.numero === 'string'
       ? c.numero.replace(/[^\d]/g, '').trim()
       : typeof c.numero === 'number'
       ? String(c.numero)
-      : ''
-  const mensagem = typeof c.mensagem === 'string' ? c.mensagem.trim() : ''
-  if (!numero || !mensagem) return null
-  return { number: numero, text: mensagem }
-}
-function parseAguarde(node: DbNode): { timeoutSeconds: number; followupText: string } {
-  const c = node.conteudo || {}
-  const raw = typeof c.timeoutSeconds === 'number' ? c.timeoutSeconds : Number(c.timeoutSeconds)
-  const timeoutSeconds = Number.isFinite(raw) && raw > 0 ? Math.min(86400, Math.floor(raw)) : 60
-  const followupText = typeof c.followupText === 'string' ? c.followupText.trim() : ''
-  return { timeoutSeconds, followupText }
+      : '';
+  const mensagem = typeof c.mensagem === 'string' ? c.mensagem.trim() : '';
+  if (!numero || !mensagem) return null;
+  return { number: numero, text: mensagem };
 }
 
-function getOutcomeTargets(edges: DbEdge[], nodeId: string): { answered: string | null; no_reply: string | null } {
-  let answered: string | null = null
-  let no_reply: string | null = null
-  for (const e of edges) {
-    if (e.source !== nodeId) continue
-    const outcome = typeof e?.data?.outcome === 'string' ? e.data.outcome : ''
-    if (outcome === 'answered') answered = e.target
-    if (outcome === 'no_reply') no_reply = e.target
-  }
-  return { answered, no_reply }
+function getNextNodeId(edges: DbEdge[], currentNodeId: string): string | null {
+  const edge = edges.find((e) => e.source === currentNodeId);
+  return edge ? edge.target : null;
 }
 
-function nextEdge(edges: DbEdge[], nodeId: string): string | null {
-  const e = edges.find(ed => ed.source === nodeId)
-  return e ? e.target : null
-}
+function planSendsForContinuation(nodes: DbNode[], edges: DbEdge[], startNodeId: string): PlannedAction[] {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const actions: PlannedAction[] = [];
+  const MAX_STEPS = 20;
 
-type PlannedAction =
-  | { kind: 'presence'; delayMs: number; state: 'composing' | 'recording'; durationMs?: number }
-  | { kind: 'text'; delayMs: number; text: string }
-  | { kind: 'image'; delayMs: number; media: string; caption?: string }
-  | { kind: 'audio'; delayMs: number; media: string }
-  | { kind: 'notify'; delayMs: number; number: string; text: string }
-
-type PlanResult = {
-  actions: PlannedAction[]
-  aguarde?: {
-    nodeId: string
-    timeoutSeconds: number
-    followupText: string
-    answeredTargetId: string | null
-    noReplyTargetId: string | null
-  }
-}
-
-function planFromNode(nodes: DbNode[], edges: DbEdge[], startId: string): PlanResult {
-  const byId = new Map(nodes.map(n => [n.id, n]))
-  const actions: PlannedAction[] = []
-  const visited = new Set<string>()
-  const MAX_STEPS = 20
-
-  let curr: DbNode | undefined = byId.get(startId)
-  let elapsedMs = 0
-  let steps = 0
-  let aguardeInfo: PlanResult['aguarde'] | undefined
+  let curr: DbNode | undefined = byId.get(startNodeId);
+  let elapsedMs = 0;
+  let steps = 0;
+  const visited = new Set<string>();
 
   while (curr && steps < MAX_STEPS) {
-    if (visited.has(curr.id)) break
-    visited.add(curr.id)
-    steps++
+    if (visited.has(curr.id)) break;
+    visited.add(curr.id);
+    steps++;
 
     if (isWaitNode(curr)) {
-      const waitMs = Math.max(0, parseWaitSeconds(curr) * 1000)
+      const waitMs = Math.max(0, parseWaitSeconds(curr) * 1000);
       if (waitMs > 0) {
-        actions.push({ kind: 'presence', state: 'composing', durationMs: Math.min(waitMs, 60000), delayMs: elapsedMs })
+        const presMs = Math.min(waitMs, 60000);
+        actions.push({ kind: 'presence', state: 'composing', durationMs: presMs, delayMs: elapsedMs });
       }
-      elapsedMs += waitMs
-      const nextId = nextEdge(edges, curr.id)
-      curr = nextId ? byId.get(nextId) : undefined
-      continue
+      elapsedMs += waitMs;
+      const nextId = getNextNodeId(edges, curr.id);
+      curr = nextId ? byId.get(nextId) : undefined;
+      continue;
     }
 
-    if (isAguardeNode(curr)) {
-      const { timeoutSeconds, followupText } = parseAguarde(curr)
-      const { answered, no_reply } = getOutcomeTargets(edges, curr.id)
-      aguardeInfo = {
-        nodeId: curr.id,
-        timeoutSeconds,
-        followupText,
-        answeredTargetId: answered,
-        noReplyTargetId: no_reply,
-      }
-      break
+    if (curr.tipo === 'mensagem_texto') {
+      const text = parseText(curr);
+      if (text) actions.push({ kind: 'text', text, delayMs: elapsedMs });
+    } else if (curr.tipo === 'mensagem_imagem') {
+      const img = parseImage(curr);
+      if (img) actions.push({ kind: 'image', urlOrBase64: img.urlOrBase64, caption: img.caption, delayMs: elapsedMs });
+    } else if (curr.tipo === 'mensagem_audio') {
+      const aud = parseAudio(curr);
+      if (aud) actions.push({ kind: 'audio', urlOrBase64: aud.urlOrBase64, delayMs: elapsedMs });
+    } else if (curr.tipo === 'mensagem_notificada') {
+      const notif = parseNotify(curr);
+      if (notif) actions.push({ kind: 'notify', number: notif.number, text: notif.text, delayMs: elapsedMs });
     }
 
-    if (isSendNode(curr)) {
-      if (curr.tipo === 'mensagem_texto') {
-        const t = parseText(curr)
-        if (t) actions.push({ kind: 'text', text: t, delayMs: elapsedMs })
-      } else if (curr.tipo === 'mensagem_imagem') {
-        const img = parseImage(curr)
-        if (img) actions.push({ kind: 'image', media: img.media, caption: img.caption, delayMs: elapsedMs })
-      } else if (curr.tipo === 'mensagem_audio') {
-        const a = parseAudio(curr)
-        if (a) actions.push({ kind: 'audio', media: a.media, delayMs: elapsedMs })
-      } else if (curr.tipo === 'mensagem_notificada') {
-        const n = parseNotify(curr)
-        if (n) actions.push({ kind: 'notify', number: n.number, text: n.text, delayMs: elapsedMs })
-      }
-    }
-
-    const nextId = nextEdge(edges, curr.id)
-    curr = nextId ? byId.get(nextId) : undefined
+    const nextId = getNextNodeId(edges, curr.id);
+    curr = nextId ? byId.get(nextId) : undefined;
   }
 
-  return { actions, aguarde: aguardeInfo }
-}
-
-async function loadGraph(fluxoId: string) {
-  const [{ data: nodes }, { data: edges }] = await Promise.all([
-    supa.from('fluxo_nos').select('id, fluxo_id, tipo, conteudo, ordem').eq('fluxo_id', fluxoId),
-    supa.from('fluxo_edge').select('id, fluxo_id, source, target, data').eq('fluxo_id', fluxoId),
-  ])
-  return { nodes: (nodes || []) as DbNode[], edges: (edges || []) as DbEdge[] }
-}
-
-async function loadConn(conexaoId: string) {
-  const { data, error } = await supa
-    .from('whatsapp_conexoes')
-    .select('id, numero, user_id, instance_id, instance_name')
-    .eq('id', conexaoId)
-    .maybeSingle()
-  if (error) throw error
-  return data
-}
-
-async function enqueuePlannedActions(params: {
-  plan: PlanResult
-  fluxoId: string
-  conexaoId: string
-  remoteJid: string
-  userId: string | null
-  instanceId: string | null
-  instanceName: string | null
-}) {
-  const { plan, fluxoId, conexaoId, remoteJid, userId, instanceId, instanceName } = params
-  for (const act of plan.actions) {
-    const kind: JobActionKind =
-      act.kind === 'text' ? 'text'
-      : act.kind === 'image' ? 'image'
-      : act.kind === 'audio' ? 'audio'
-      : act.kind === 'presence' ? 'presence'
-      : 'notify'
-
-    const payload =
-      act.kind === 'text' ? { text: act.text } :
-      act.kind === 'image' ? { media: act.media, caption: (act as any).caption ?? null } :
-      act.kind === 'audio' ? { media: act.media } :
-      act.kind === 'presence' ? { state: act.state, durationMs: act.durationMs ?? 3000 } :
-      { number: (act as any).number, text: (act as any).text }
-
-    await enqueueJob({
-      conexaoId,
-      fluxoId,
-      userId,
-      remoteJid,
-      instanceId,
-      instanceName,
-      actionKind: kind,
-      payload,
-      delayMs: act.delayMs,
-    })
-  }
-}
-
-async function createAguardeRow(params: {
-  fluxoId: string
-  nodeId: string
-  remoteJid: string
-  conexaoId: string
-  userId: string | null
-  timeoutSeconds: number
-  followupText?: string
-  answeredTargetId: string | null
-  noReplyTargetId: string | null
-}) {
-  const now = new Date()
-  const expires = new Date(now.getTime() + params.timeoutSeconds * 1000)
-  await supa.from('fluxo_esperas').insert({
-    status: 'pending',
-    created_at: now.toISOString(),
-    expires_at: expires.toISOString(),
-    fluxo_id: params.fluxoId,
-    node_id: params.nodeId,
-    remote_jid: params.remoteJid,
-    whatsapp_conexao_id: params.conexaoId,
-    user_id: params.userId,
-    answered_target_id: params.answeredTargetId,
-    no_reply_target_id: params.noReplyTargetId,
-    followup_text: params.followupText ? { text: params.followupText } : null,
-  })
+  return actions;
 }
 
 /* =========================
-   === AGUARDE === processors
+   WAIT EXPIRATION (fluxo_esperas)
    ========================= */
 
-async function claimExpiredEsperas(limit = 20) {
-  const nowIso = new Date().toISOString()
-  // pega IDs candidatas
-  const { data: rows, error } = await supa
+async function claimExpiredWaits(limit = 20) {
+  // busca candidatos
+  const nowIso = new Date().toISOString();
+  const { data: candidates, error } = await supa
     .from('fluxo_esperas')
     .select('id')
     .eq('status', 'pending')
     .lte('expires_at', nowIso)
     .order('expires_at', { ascending: true })
-    .limit(limit)
+    .limit(limit);
+
   if (error) {
-    console.error('[worker][aguarde][claimExpired] error', error)
-    return []
+    console.error('[worker][claimExpiredWaits] supabase error', error);
+    return [];
   }
-  const claimed: any[] = []
-  for (const r of rows || []) {
-    // marca como expired de forma atômica
-    const { data: upd, error: upErr } = await supa
+  if (!candidates?.length) return [];
+
+  // tenta "lockar" cada um via update atômico (pending -> expired)
+  const claimed: any[] = [];
+  for (const c of candidates) {
+    const { data: updated, error: upErr } = await supa
       .from('fluxo_esperas')
       .update({ status: 'expired' })
-      .eq('id', r.id)
+      .eq('id', c.id)
       .eq('status', 'pending')
       .select('*')
-      .maybeSingle()
+      .maybeSingle();
+
     if (upErr) {
-      console.error('[worker][aguarde][claimExpired] update error', upErr)
-      continue
+      console.error('[worker][claimExpiredWaits] update error', upErr);
+      continue;
     }
-    if (upd) claimed.push(upd)
+    if (updated) claimed.push(updated);
   }
-  return claimed
+  return claimed;
 }
 
-async function processExpiredEspera(row: any) {
+function extractFollowupText(raw: unknown): string {
+  // aceita: string crua | objeto { text } | string JSON
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s) return '';
+    try {
+      const obj = JSON.parse(s);
+      if (obj && typeof obj.text === 'string' && obj.text.trim()) return obj.text.trim();
+    } catch {
+      return s; // era string comum
+    }
+    return '';
+  }
+  if (raw && typeof raw === 'object' && typeof (raw as any).text === 'string') {
+    const s = (raw as any).text.trim();
+    return s || '';
+  }
+  return '';
+}
+
+async function processExpiredWait(wait: any) {
   try {
-    const fluxoId = row.fluxo_id as string
-    const conexaoId = row.whatsapp_conexao_id as string
-    const remoteJid = row.remote_jid as string
-    const userId = (row.user_id as string) ?? null
-    const followupText = row.followup_text?.text as string | undefined
-    const targetId = (row.no_reply_target_id as string) || null
+    // carrega conexão (para descobrir instance e user)
+    const { data: conn, error: connErr } = await supa
+      .from('whatsapp_conexoes')
+      .select('id, user_id, instance_id, instance_name')
+      .eq('id', wait.whatsapp_conexao_id)
+      .maybeSingle();
+    if (connErr || !conn) throw new Error('whatsapp_conexao não encontrada');
 
-    // carrega conn (pra pegar instance info)
-    const conn = await loadConn(conexaoId)
+    const instanceId = conn.instance_id ?? null;
+    const instanceName = conn.instance_name ?? null;
 
-    // follow-up opcional
-    if (followupText && followupText.trim()) {
+    // 1) follow-up (se houver)
+    const follow = extractFollowupText(wait.followup_text);
+    if (follow) {
       await enqueueJob({
-        conexaoId,
-        fluxoId,
-        userId,
-        remoteJid,
-        instanceId: conn?.instance_id ?? null,
-        instanceName: conn?.instance_name ?? null,
+        conexaoId: wait.whatsapp_conexao_id,
+        fluxoId: wait.fluxo_id ?? null,
+        userId: conn.user_id ?? null,
+        remoteJid: wait.remote_jid,
+        instanceId,
+        instanceName,
         actionKind: 'text',
-        payload: { text: followupText.trim() },
+        payload: { text: follow },
         delayMs: 0,
-      })
+      });
     }
 
-    if (targetId) {
-      // continua fluxo a partir do nó no_reply
-      const { nodes, edges } = await loadGraph(fluxoId)
-      const plan = planFromNode(nodes, edges, targetId)
+    // 2) continuar o fluxo pelo no_reply_target_id
+    const startId: string | null = wait.no_reply_target_id || null;
+    if (!startId) return; // nada a seguir
 
-      // enfileira ações
-      await enqueuePlannedActions({
-        plan,
-        fluxoId,
-        conexaoId,
-        remoteJid,
-        userId,
-        instanceId: conn?.instance_id ?? null,
-        instanceName: conn?.instance_name ?? null,
-      })
+    // carrega grafo do fluxo
+    const [{ data: nodes }, { data: edges }] = await Promise.all([
+      supa.from('fluxo_nos')
+        .select('id, fluxo_id, tipo, conteudo, ordem')
+        .eq('fluxo_id', wait.fluxo_id),
+      supa.from('fluxo_edge')
+        .select('id, fluxo_id, source, target, data')
+        .eq('fluxo_id', wait.fluxo_id),
+    ]);
+    if (!nodes?.length) return;
 
-      // se o plano parar em novo aguarde → cria nova espera
-      if (plan.aguarde) {
-        await createAguardeRow({
-          fluxoId,
-          nodeId: plan.aguarde.nodeId,
-          remoteJid,
-          conexaoId,
-          userId,
-          timeoutSeconds: plan.aguarde.timeoutSeconds,
-          followupText: plan.aguarde.followupText,
-          answeredTargetId: plan.aguarde.answeredTargetId,
-          noReplyTargetId: plan.aguarde.noReplyTargetId,
-        })
+    const actions = planSendsForContinuation(
+      nodes as unknown as DbNode[],
+      edges as unknown as DbEdge[],
+      startId
+    );
+    if (!actions.length) return;
+
+    // enfileira todas as ações
+    for (const a of actions) {
+      if (a.kind === 'presence') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: wait.fluxo_id ?? null,
+          userId: conn.user_id ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId,
+          instanceName,
+          actionKind: 'presence',
+          payload: { state: a.state, durationMs: a.durationMs ?? 3000 },
+          delayMs: a.delayMs,
+        });
+      } else if (a.kind === 'text') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: wait.fluxo_id ?? null,
+          userId: conn.user_id ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId,
+          instanceName,
+          actionKind: 'text',
+          payload: { text: a.text },
+          delayMs: a.delayMs,
+        });
+      } else if (a.kind === 'image') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: wait.fluxo_id ?? null,
+          userId: conn.user_id ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId,
+          instanceName,
+          actionKind: 'image',
+          payload: { media: a.urlOrBase64, caption: a.caption ?? null },
+          delayMs: a.delayMs,
+        });
+      } else if (a.kind === 'audio') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: wait.fluxo_id ?? null,
+          userId: conn.user_id ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId,
+          instanceName,
+          actionKind: 'audio',
+          payload: { media: a.urlOrBase64 },
+          delayMs: a.delayMs,
+        });
+      } else if (a.kind === 'notify') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: wait.fluxo_id ?? null,
+          userId: conn.user_id ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId,
+          instanceName,
+          actionKind: 'notify',
+          payload: { number: a.number, text: a.text },
+          delayMs: a.delayMs,
+        });
       }
     }
-
-    // remove a espera (evita reprocesso)
-    await supa.from('fluxo_esperas').delete().eq('id', row.id)
   } catch (e) {
-    console.error('[worker][aguarde][expired] process error', e)
-    // não remove a linha — fica para nova tentativa num próximo ciclo (ou tratamento manual)
-  }
-}
-
-async function claimAnsweredEsperas(limit = 20) {
-  // pega IDs de esperas já marcadas como answered (pelo webhook de inbound)
-  const { data: rows, error } = await supa
-    .from('fluxo_esperas')
-    .select('id')
-    .eq('status', 'answered')
-    .order('created_at', { ascending: true })
-    .limit(limit)
-  if (error) {
-    console.error('[worker][aguarde][claimAnswered] error', error)
-    return []
-  }
-  const claimed: any[] = []
-  for (const r of rows || []) {
-    // “trava” marcando para um estado transitório: aqui podemos só refetch e processar;
-    // para evitar corrida, usamos update com eq('status','answered') -> volta o registro completo
-    const { data: upd, error: upErr } = await supa
-      .from('fluxo_esperas')
-      .update({ status: 'answered' }) // mantém answered, mas retorna linha
-      .eq('id', r.id)
-      .eq('status', 'answered')
-      .select('*')
-      .maybeSingle()
-    if (upErr) {
-      console.error('[worker][aguarde][claimAnswered] update error', upErr)
-      continue
-    }
-    if (upd) claimed.push(upd)
-  }
-  return claimed
-}
-
-async function processAnsweredEspera(row: any) {
-  try {
-    const fluxoId = row.fluxo_id as string
-    const conexaoId = row.whatsapp_conexao_id as string
-    const remoteJid = row.remote_jid as string
-    const userId = (row.user_id as string) ?? null
-    const targetId = (row.answered_target_id as string) || null
-
-    if (!targetId) {
-      // nada a seguir → apenas remove a espera
-      await supa.from('fluxo_esperas').delete().eq('id', row.id)
-      return
-    }
-
-    const conn = await loadConn(conexaoId)
-    const { nodes, edges } = await loadGraph(fluxoId)
-    const plan = planFromNode(nodes, edges, targetId)
-
-    await enqueuePlannedActions({
-      plan,
-      fluxoId,
-      conexaoId,
-      remoteJid,
-      userId,
-      instanceId: conn?.instance_id ?? null,
-      instanceName: conn?.instance_name ?? null,
-    })
-
-    if (plan.aguarde) {
-      await createAguardeRow({
-        fluxoId,
-        nodeId: plan.aguarde.nodeId,
-        remoteJid,
-        conexaoId,
-        userId,
-        timeoutSeconds: plan.aguarde.timeoutSeconds,
-        followupText: plan.aguarde.followupText,
-        answeredTargetId: plan.aguarde.answeredTargetId,
-        noReplyTargetId: plan.aguarde.noReplyTargetId,
-      })
-    }
-
-    // remove a espera (processada)
-    await supa.from('fluxo_esperas').delete().eq('id', row.id)
-  } catch (e) {
-    console.error('[worker][aguarde][answered] process error', e)
+    console.error('[worker][processExpiredWait] error', e);
+    // opcional: marcar como failed? por enquanto fica como "expired" mesmo.
   }
 }
 
@@ -838,21 +721,19 @@ async function processAnsweredEspera(row: any) {
    ========================= */
 async function loop() {
   try {
-    // 1) enviar jobs vencidos/pendentes
-    const jobs = await claimJobs(10)
-    for (const j of jobs) await processJob(j)
+    // 1) processa esperas expiradas (Aguarde)
+    const waits = await claimExpiredWaits(20);
+    for (const w of waits) {
+      await processExpiredWait(w);
+    }
 
-    // 2) tratar expiradas (aguarde → no_reply)
-    const expired = await claimExpiredEsperas(20)
-    for (const r of expired) await processExpiredEspera(r)
-
-    // 3) tratar respondidas (aguarde → answered)
-    const answered = await claimAnsweredEsperas(20)
-    for (const r of answered) await processAnsweredEspera(r)
+    // 2) processa jobs normais (fila de envios)
+    const jobs = await claimJobs(10);
+    for (const j of jobs) await processJob(j);
   } catch (e) {
-    console.error('[worker][loop error]', e)
+    console.error('[worker][loop error]', e);
   } finally {
-    setTimeout(loop, 1000)
+    setTimeout(loop, 1000);
   }
 }
 
