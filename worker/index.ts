@@ -22,6 +22,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !EVO_BASE || !EVO_KEY) {
 
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 const WORKER_ID = `worker-${Math.random().toString(36).slice(2, 6)}`
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /* =========================
    EVO HELPERS
@@ -52,6 +53,11 @@ function isDataUri(s: string) {
   return typeof s === 'string' && s.startsWith('data:')
 }
 
+function guessMimeFromDataUri(dataUri: string): string {
+  const m = /^data:([^;]+);base64,/.exec(dataUri)
+  return m?.[1] || 'audio/ogg'
+}
+
 function inferFilenameAndMime(media: string): { filename: string; mimetype: string } {
   try {
     const u = new URL(media)
@@ -62,20 +68,14 @@ function inferFilenameAndMime(media: string): { filename: string; mimetype: stri
     if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return { filename: name, mimetype: 'audio/ogg' }
     return { filename: name, mimetype: 'application/octet-stream' }
   } catch {
-    // data URI ou string sem URL válida
     return { filename: 'audio.ogg', mimetype: isDataUri(media) ? guessMimeFromDataUri(media) : 'audio/ogg' }
   }
-}
-
-function guessMimeFromDataUri(dataUri: string): string {
-  const m = /^data:([^;]+);base64,/.exec(dataUri)
-  return m?.[1] || 'audio/ogg'
 }
 
 /* =========================
    QUEUE HELPERS (fluxo_agendamentos)
    ========================= */
-type QueueActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify';
+type QueueActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify' | 'start_flow';
 
 async function enqueueJob(params: {
   conexaoId: string;
@@ -122,7 +122,6 @@ async function evoSend(
   number: string,
   payload: Record<string, any>
 ) {
-  // para notify o destino vem do payload; para os demais, do arg number
   const num = kind === 'notify' ? normalizeNumber(payload.number) : normalizeNumber(number)
 
   if (kind === 'notify') {
@@ -143,9 +142,7 @@ async function evoSend(
       throw new Error('image payload sem media (string URL ou data URI)')
     }
 
-    // Inferir mimetype e nome a partir da URL ou data URI
     const inferImage = (m: string) => {
-      // data:image/png;base64,...
       if (isDataUri(m)) {
         const mm = /^data:([^;]+);base64,/i.exec(m)
         const mime = mm?.[1] || 'image/jpeg'
@@ -156,7 +153,6 @@ async function evoSend(
           'jpg'
         return { mimetype: mime, fileName: `image.${ext}` }
       }
-      // URL comum
       try {
         const u = new URL(m)
         const name = u.pathname.split('/').pop() || 'image.jpg'
@@ -177,10 +173,10 @@ async function evoSend(
 
     const body = {
       number: num,
-      mediatype: 'image',     // v2.3.x exige isso
+      mediatype: 'image',
       mimetype,
       fileName,
-      media,                  // aceita URL pública OU data URI
+      media,
       ...(payload.caption ? { caption: payload.caption } : {}),
       ...(payload.delay ? { delay: payload.delay } : {}),
     }
@@ -189,15 +185,11 @@ async function evoSend(
   }
 
   if (kind === 'presence') {
-    // Agora enviando presença de verdade (digitando/gravando)
     const presence = payload.state === 'recording' ? 'recording' : 'composing'
-    const duration = Math.max(0, Math.min(60000, Number(payload.durationMs ?? 3000))) // 0..60s
+    const duration = Math.max(0, Math.min(60000, Number(payload.durationMs ?? 3000)))
     const body = {
       number: num,
-      options: {
-        presence,       // "composing" (digitando) | "recording" (gravando)
-        delay: duration // duração em ms
-      }
+      options: { presence, delay: duration }
     }
     return evoPostJson(`/chat/sendPresence/${instance}`, body)
   }
@@ -207,11 +199,11 @@ async function evoSend(
     const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) }
     const { filename, mimetype } = inferFilenameAndMime(media)
 
-    // 0) PTT nativo (documentado): sendWhatsAppAudio { number, audio, delay? }
+    // 0) PTT nativo
     {
       const r0 = await evoPostRaw(`/message/sendWhatsAppAudio/${instance}`, {
         number: num,
-        audio: media,             // aceita URL pública ou data URI base64
+        audio: media,
         ...(payload.delay ? { delay: payload.delay } : {}),
       })
       if (r0.ok) return r0.json().catch(() => ({}))
@@ -222,7 +214,7 @@ async function evoSend(
       }
     }
 
-    // 1) PTT (voice note) legado: sendVoice tentando audio -> media -> base64
+    // 1) PTT legado
     {
       let r = await evoPostRaw(`/message/sendVoice/${instance}`, { ...base, audio: media, mimetype })
       if (r.ok) return r.json().catch(() => ({}))
@@ -251,7 +243,7 @@ async function evoSend(
       }
     }
 
-    // 2) Áudio comum (com ptt: true para alguns servidores)
+    // 2) Áudio comum (com ptt: true)
     {
       const r = await evoPostRaw(`/message/sendAudio/${instance}`, { ...base, audio: media, mimetype, ptt: true })
       if (r.ok) return r.json().catch(() => ({}))
@@ -262,7 +254,7 @@ async function evoSend(
       }
     }
 
-    // 3) Fallback como documento (vai chegar como arquivo)
+    // 3) Fallback documento
     {
       const r = await evoPostRaw(`/message/sendMedia/${instance}`, {
         ...base,
@@ -285,7 +277,7 @@ async function evoSend(
 /* =========================
    JOB QUEUE (fluxo_agendamentos)
    ========================= */
-type JobActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify'
+type JobActionKind = 'text' | 'image' | 'audio' | 'presence' | 'notify' | 'start_flow'
 
 async function claimJobs(limit = 10) {
   const nowIso = new Date().toISOString()
@@ -322,91 +314,21 @@ async function claimJobs(limit = 10) {
   return claimed
 }
 
-async function processJob(job: any) {
-  try {
-    // payload pode vir como string JSON
-    const payload =
-      typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {})
-
-    // para 'notify' o destino é payload.number; para os demais, remote_jid
-    const isNotify = job.action_kind === 'notify'
-    const number = isNotify ? (payload.number ?? '') : job.remote_jid
-
-    // tenta primeiro pelo NOME da instância, depois pelo ID (fallback)
-    const candidates = [job.instance_name, job.instance_id].filter(Boolean) as string[]
-    if (candidates.length === 0) throw new Error('sem instance_id/name')
-
-    let sent = false
-    let lastErr: unknown = null
-
-    for (const inst of candidates) {
-      try {
-        await evoSend(job.action_kind as SendKind, inst, number, payload)
-        sent = true
-        break
-      } catch (e) {
-        lastErr = e
-        const msg = e instanceof Error ? e.message : String(e)
-        // Se for erro claro de instância inválida/404, tenta o próximo identificador
-        if (!/instance does not exist|Cannot POST|404/.test(msg)) {
-          throw e // erro real (payload inválido, etc.) → não adianta trocar instância
-        }
-      }
-    }
-
-    if (!sent) {
-      throw (lastErr ?? new Error('Falha ao enviar: nenhum identificador de instância válido.'))
-    }
-
-    // log opcional em mensagens (marca notify explicitamente)
-    await supa.from('mensagens').insert({
-      whatsapp_conexao_id: job.whatsapp_conexao_id,
-      fluxo_id: job.fluxo_id,
-      user_id: job.user_id,
-      de: null,
-      para: normalizeNumber(number),
-      direcao: 'enviada',
-      conteudo: isNotify ? { notify: true, text: (payload as any).text } : payload,
-      timestamp: new Date().toISOString(),
-    })
-
-    await supa
-      .from('fluxo_agendamentos')
-      .update({ status: 'done', last_error: null })
-      .eq('id', job.id)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const attempts = (job.attempts ?? 0) + 1
-
-    if (attempts < (job.max_attempts ?? 5)) {
-      const next = new Date(Date.now() + 10_000 * attempts).toISOString()
-      await supa
-        .from('fluxo_agendamentos')
-        .update({
-          status: 'pending',
-          attempts,
-          last_error: msg,
-          due_at: next,
-          locked_at: null,
-          locked_by: null,
-        })
-        .eq('id', job.id)
-    } else {
-      await supa
-        .from('fluxo_agendamentos')
-        .update({ status: 'failed', attempts, last_error: msg })
-        .eq('id', job.id)
-    }
-  }
-}
-
 /* =========================
-   MINI PLANNER p/ continuação do fluxo
+   GRAFO + PLANEJAMENTO (start_flow e continuação)
    ========================= */
 type DbNode = {
   id: string;
   fluxo_id: string;
-  tipo: 'mensagem_texto' | 'mensagem_imagem' | 'mensagem_audio' | 'mensagem_espera' | 'mensagem_notificada' | string;
+  tipo:
+    | 'mensagem_texto'
+    | 'mensagem_imagem'
+    | 'mensagem_audio'
+    | 'mensagem_espera'
+    | 'mensagem_notificada'
+    | 'aguarde_resposta'
+    | 'next_flow'
+    | string;
   conteudo: unknown; // jsonb
   ordem: number;
 };
@@ -419,14 +341,9 @@ type DbEdge = {
   data: unknown;  // jsonb com "outcome" etc (opcional)
 };
 
-type PlannedAction =
-  | { kind: 'text'; text: string; delayMs: number }
-  | { kind: 'image'; urlOrBase64: string; caption?: string; delayMs: number }
-  | { kind: 'audio'; urlOrBase64: string; delayMs: number }
-  | { kind: 'presence'; state: 'composing' | 'recording'; durationMs?: number; delayMs: number }
-  | { kind: 'notify'; number: string; text: string; delayMs: number };
-
 const isWaitNode = (n: DbNode) => n.tipo === 'mensagem_espera';
+const isAguardeNode = (n: DbNode) => n.tipo === 'aguarde_resposta';
+const isNextFlowNode = (n: DbNode) => n.tipo === 'next_flow';
 
 function parseWaitSeconds(node: DbNode): number {
   const c = (node.conteudo ?? {}) as { waitSeconds?: unknown };
@@ -481,20 +398,76 @@ function parseNotify(node: DbNode): { number: string; text: string } | null {
   return { number: numero, text: mensagem };
 }
 
+function parseAguarde(node: DbNode): { timeoutSeconds: number; followupText: string } {
+  const c = (node.conteudo ?? {}) as { timeoutSeconds?: unknown; followupText?: unknown };
+  const rawT = typeof c.timeoutSeconds === 'number' ? c.timeoutSeconds : Number(c.timeoutSeconds);
+  const timeoutSeconds = Number.isFinite(rawT) && rawT > 0 ? Math.min(86400, Math.floor(rawT)) : 60;
+  const followupText =
+    typeof c.followupText === 'string' && c.followupText.trim() ? c.followupText.trim() : '';
+  return { timeoutSeconds, followupText };
+}
+
+function parseNextFlowTarget(node: DbNode): string | null {
+  const c = (node.conteudo ?? {}) as { targetFluxoId?: unknown };
+  const raw = typeof c.targetFluxoId === 'string' ? c.targetFluxoId.trim() : '';
+  return UUID_RE.test(raw) ? raw : null;
+}
+
 function getNextNodeId(edges: DbEdge[], currentNodeId: string): string | null {
   const edge = edges.find((e) => e.source === currentNodeId);
   return edge ? edge.target : null;
 }
 
-function planSendsForContinuation(nodes: DbNode[], edges: DbEdge[], startNodeId: string): PlannedAction[] {
+function getOutcomeTargets(edges: DbEdge[], nodeId: string): {
+  answered: string | null;
+  no_reply: string | null;
+} {
+  let answered: string | null | undefined = undefined;
+  let no_reply: string | null | undefined = undefined;
+  for (const e of edges) {
+    if (e.source !== nodeId) continue;
+    const d = (e.data ?? {}) as { outcome?: unknown };
+    const outcome = typeof d.outcome === 'string' ? d.outcome : '';
+    if (outcome === 'answered') answered = e.target;
+    if (outcome === 'no_reply') no_reply = e.target;
+  }
+  return { answered: answered ?? null, no_reply: no_reply ?? null };
+}
+
+type PlannedAction =
+  | { kind: 'text'; text: string; delayMs: number }
+  | { kind: 'image'; urlOrBase64: string; caption?: string; delayMs: number }
+  | { kind: 'audio'; urlOrBase64: string; delayMs: number }
+  | { kind: 'presence'; state: 'composing' | 'recording'; durationMs?: number; delayMs: number }
+  | { kind: 'notify'; number: string; text: string; delayMs: number }
+  | { kind: 'next_flow'; targetFluxoId: string; delayMs: number };
+
+type PlanResult = {
+  actions: PlannedAction[];
+  aguarde?: {
+    nodeId: string;
+    timeoutSeconds: number;
+    followupText: string;
+    answeredTargetId: string | null;
+    noReplyTargetId: string | null;
+  };
+};
+
+/** Planeja a partir de um nó inicial:
+ * - respeita waits (presence + delay)
+ * - para em aguarde_resposta (envia followupText imediato e retorna metadados)
+ * - para em next_flow (gera ação de handoff)
+ */
+function planSends(nodes: DbNode[], edges: DbEdge[], startNodeId: string): PlanResult {
   const byId = new Map(nodes.map((n) => [n.id, n]));
-  const actions: PlannedAction[] = [];
   const MAX_STEPS = 20;
 
+  const actions: PlannedAction[] = [];
   let curr: DbNode | undefined = byId.get(startNodeId);
   let elapsedMs = 0;
   let steps = 0;
   const visited = new Set<string>();
+  let aguardeInfo: PlanResult['aguarde'] | undefined;
 
   while (curr && steps < MAX_STEPS) {
     if (visited.has(curr.id)) break;
@@ -511,6 +484,30 @@ function planSendsForContinuation(nodes: DbNode[], edges: DbEdge[], startNodeId:
       const nextId = getNextNodeId(edges, curr.id);
       curr = nextId ? byId.get(nextId) : undefined;
       continue;
+    }
+
+    if (isAguardeNode(curr)) {
+      const params = parseAguarde(curr);
+      const { answered, no_reply } = getOutcomeTargets(edges, curr.id);
+
+      if (params.followupText && params.followupText.trim()) {
+        actions.push({ kind: 'text', text: params.followupText.trim(), delayMs: elapsedMs });
+      }
+
+      aguardeInfo = {
+        nodeId: curr.id,
+        timeoutSeconds: params.timeoutSeconds,
+        followupText: params.followupText,
+        answeredTargetId: answered,
+        noReplyTargetId: no_reply,
+      };
+      break;
+    }
+
+    if (isNextFlowNode(curr)) {
+      const target = parseNextFlowTarget(curr);
+      if (target) actions.push({ kind: 'next_flow', targetFluxoId: target, delayMs: elapsedMs });
+      break;
     }
 
     if (curr.tipo === 'mensagem_texto') {
@@ -531,15 +528,255 @@ function planSendsForContinuation(nodes: DbNode[], edges: DbEdge[], startNodeId:
     curr = nextId ? byId.get(nextId) : undefined;
   }
 
-  return actions;
+  return { actions, aguarde: aguardeInfo };
+}
+
+function pickStartNodeId(nodes: DbNode[]): string | null {
+  if (!nodes.length) return null
+  // preferir nó "enviável" de menor ordem; fallback: menor ordem geral
+  const sendable = nodes
+    .filter(n => n.tipo === 'mensagem_texto' || n.tipo === 'mensagem_imagem' || n.tipo === 'mensagem_audio' || n.tipo === 'mensagem_notificada' || n.tipo === 'mensagem_espera' || n.tipo === 'aguarde_resposta' || n.tipo === 'next_flow')
+    .sort((a,b) => (a.ordem ?? 0) - (b.ordem ?? 0))
+  if (sendable.length) return sendable[0].id
+  const sorted = [...nodes].sort((a,b) => (a.ordem ?? 0) - (b.ordem ?? 0))
+  return sorted[0].id
+}
+
+/** Inicia (ou continua) um fluxo: planeja e enfileira as ações; cria fluxo_esperas se preciso; 
+ *  se encontrar next_flow, enfileira outro start_flow com o delay acumulado. */
+async function startFlowFromWorker(args: {
+  conexaoId: string
+  fluxoId: string
+  remoteJid: string
+  instanceId?: string | null
+  instanceName?: string | null
+  userId?: string | null
+  extraDelayMs?: number // quando vier de um start_flow com delay acumulado
+}) {
+  const { conexaoId, fluxoId, remoteJid, instanceId, instanceName, userId, extraDelayMs = 0 } = args
+
+  const [{ data: nodes }, { data: edges }] = await Promise.all([
+    supa.from('fluxo_nos')
+      .select('id, fluxo_id, tipo, conteudo, ordem')
+      .eq('fluxo_id', fluxoId)
+      .order('ordem', { ascending: true }),
+    supa.from('fluxo_edge')
+      .select('id, fluxo_id, source, target, data')
+      .eq('fluxo_id', fluxoId),
+  ])
+
+  if (!nodes?.length) return
+
+  const startId = pickStartNodeId(nodes as DbNode[])
+  if (!startId) return
+
+  const plan = planSends(nodes as DbNode[], edges as DbEdge[], startId)
+
+  // criar espera (aguarde_resposta), se houver
+  if (plan.aguarde) {
+    const now = new Date()
+    const expires = new Date(now.getTime() + plan.aguarde.timeoutSeconds * 1000)
+
+    await supa.from('fluxo_esperas').insert({
+      status: 'pending',
+      created_at: now.toISOString(),
+      expires_at: expires.toISOString(),
+      fluxo_id: fluxoId,
+      node_id: plan.aguarde.nodeId,
+      remote_jid: remoteJid,
+      whatsapp_conexao_id: conexaoId,
+      user_id: userId ?? null,
+      answered_target_id: plan.aguarde.answeredTargetId,
+      no_reply_target_id: plan.aguarde.noReplyTargetId,
+      followup_text: plan.aguarde.followupText ? { text: plan.aguarde.followupText } : null,
+      instance_id: instanceId ?? null,
+      instance_name: instanceName ?? null,
+    })
+  }
+
+  // enfileirar ações
+  for (const a of plan.actions) {
+    const delay = (a.delayMs ?? 0) + extraDelayMs
+    if (a.kind === 'presence') {
+      await enqueueJob({
+        conexaoId,
+        fluxoId,
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'presence',
+        payload: { state: a.state, durationMs: a.durationMs ?? 3000 },
+        delayMs: delay,
+      })
+    } else if (a.kind === 'text') {
+      await enqueueJob({
+        conexaoId,
+        fluxoId,
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'text',
+        payload: { text: a.text },
+        delayMs: delay,
+      })
+    } else if (a.kind === 'image') {
+      await enqueueJob({
+        conexaoId,
+        fluxoId,
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'image',
+        payload: { media: a.urlOrBase64, caption: a.caption ?? null },
+        delayMs: delay,
+      })
+    } else if (a.kind === 'audio') {
+      await enqueueJob({
+        conexaoId,
+        fluxoId,
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'audio',
+        payload: { media: a.urlOrBase64 },
+        delayMs: delay,
+      })
+    } else if (a.kind === 'notify') {
+      await enqueueJob({
+        conexaoId,
+        fluxoId,
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'notify',
+        payload: { number: a.number, text: a.text },
+        delayMs: delay,
+      })
+    } else if (a.kind === 'next_flow') {
+      // handoff em cadeia: agenda um novo start_flow respeitando o delay acumulado
+      await enqueueJob({
+        conexaoId,
+        fluxoId: a.targetFluxoId, // associa o job ao fluxo de destino
+        userId: userId ?? null,
+        remoteJid,
+        instanceId,
+        instanceName,
+        actionKind: 'start_flow',
+        payload: { targetFluxoId: a.targetFluxoId },
+        delayMs: delay,
+      })
+    }
+  }
+}
+
+/* =========================
+   PROCESSADOR DE JOB
+   ========================= */
+async function processJob(job: any) {
+  try {
+    const payload = typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {})
+
+    // 'notify' → destino em payload.number; demais → remote_jid
+    const isNotify = job.action_kind === 'notify'
+    const number = isNotify ? (payload.number ?? '') : job.remote_jid
+
+    // start_flow: inicia o fluxo de destino aqui no worker
+    if (job.action_kind === 'start_flow') {
+      const target: string = payload?.targetFluxoId || job.fluxo_id
+      if (!UUID_RE.test(String(target || ''))) {
+        throw new Error('start_flow sem targetFluxoId válido')
+      }
+
+      await startFlowFromWorker({
+        conexaoId: job.whatsapp_conexao_id,
+        fluxoId: target,
+        remoteJid: job.remote_jid,
+        instanceId: job.instance_id,
+        instanceName: job.instance_name,
+        userId: job.user_id,
+        // se quiser “carregar” um atraso já vencido, poderia usar due_at diff; aqui não precisa
+      })
+
+      await supa.from('fluxo_agendamentos')
+        .update({ status: 'done', last_error: null })
+        .eq('id', job.id)
+
+      return
+    }
+
+    // envio normal (text/image/audio/presence/notify)
+    const candidates = [job.instance_name, job.instance_id].filter(Boolean) as string[]
+    if (candidates.length === 0) throw new Error('sem instance_id/name')
+
+    let sent = false
+    let lastErr: unknown = null
+
+    for (const inst of candidates) {
+      try {
+        await evoSend(job.action_kind as SendKind, inst, number, payload)
+        sent = true
+        break
+      } catch (e) {
+        lastErr = e
+        const msg = e instanceof Error ? e.message : String(e)
+        if (!/instance does not exist|Cannot POST|404/.test(msg)) {
+          throw e
+        }
+      }
+    }
+
+    if (!sent) throw (lastErr ?? new Error('Falha ao enviar: nenhum identificador de instância válido.'))
+
+    await supa.from('mensagens').insert({
+      whatsapp_conexao_id: job.whatsapp_conexao_id,
+      fluxo_id: job.fluxo_id,
+      user_id: job.user_id,
+      de: null,
+      para: normalizeNumber(number),
+      direcao: 'enviada',
+      conteudo: isNotify ? { notify: true, text: (payload as any).text } : payload,
+      timestamp: new Date().toISOString(),
+    })
+
+    await supa.from('fluxo_agendamentos')
+      .update({ status: 'done', last_error: null })
+      .eq('id', job.id)
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    const attempts = (job.attempts ?? 0) + 1
+
+    if (attempts < (job.max_attempts ?? 5)) {
+      const next = new Date(Date.now() + 10_000 * attempts).toISOString()
+      await supa
+        .from('fluxo_agendamentos')
+        .update({
+          status: 'pending',
+          attempts,
+          last_error: msg,
+          due_at: next,
+          locked_at: null,
+          locked_by: null,
+        })
+        .eq('id', job.id)
+    } else {
+      await supa
+        .from('fluxo_agendamentos')
+        .update({ status: 'failed', attempts, last_error: msg })
+        .eq('id', job.id)
+    }
+  }
 }
 
 /* =========================
    WAIT EXPIRATION (fluxo_esperas)
    ========================= */
-
 async function claimExpiredWaits(limit = 20) {
-  // busca candidatos
   const nowIso = new Date().toISOString();
   const { data: candidates, error } = await supa
     .from('fluxo_esperas')
@@ -551,11 +788,9 @@ async function claimExpiredWaits(limit = 20) {
 
   if (error) {
     console.error('[worker][claimExpiredWaits] supabase error', error);
-    return [];
   }
   if (!candidates?.length) return [];
 
-  // tenta "lockar" cada um via update atômico (pending -> expired)
   const claimed: any[] = [];
   for (const c of candidates) {
     const { data: updated, error: upErr } = await supa
@@ -576,7 +811,6 @@ async function claimExpiredWaits(limit = 20) {
 }
 
 function extractFollowupText(raw: unknown): string {
-  // aceita: string crua | objeto { text } | string JSON
   if (typeof raw === 'string') {
     const s = raw.trim();
     if (!s) return '';
@@ -584,7 +818,7 @@ function extractFollowupText(raw: unknown): string {
       const obj = JSON.parse(s);
       if (obj && typeof obj.text === 'string' && obj.text.trim()) return obj.text.trim();
     } catch {
-      return s; // era string comum
+      return s;
     }
     return '';
   }
@@ -600,7 +834,6 @@ async function resolveInstanceAndUserForWait(wait: any): Promise<{
   instanceName: string | null;
   userId: string | null;
 }> {
-  // 1) Tenta pegar direto da própria linha de fluxo_esperas
   let instanceId: string | null = wait.instance_id ?? null;
   let instanceName: string | null = wait.instance_name ?? null;
   let userId: string | null = wait.user_id ?? null;
@@ -609,9 +842,7 @@ async function resolveInstanceAndUserForWait(wait: any): Promise<{
     return { instanceId, instanceName, userId };
   }
 
-  // 2) Fallback: busca o ÚLTIMO job da mesma conexão + (mesmo fluxo + mesmo remote_jid)
-  //    Ajuste a chave de ordenação conforme seu schema (created_at é o mais comum)
-  const { data: lastJobs, error } = await supa
+  const { data: lastJobs } = await supa
     .from('fluxo_agendamentos')
     .select('instance_id, instance_name, user_id')
     .eq('whatsapp_conexao_id', wait.whatsapp_conexao_id)
@@ -620,22 +851,21 @@ async function resolveInstanceAndUserForWait(wait: any): Promise<{
     .order('created_at', { ascending: false })
     .limit(1);
 
-  if (!error && lastJobs?.length) {
+  if (lastJobs?.length) {
     instanceId = lastJobs[0]?.instance_id ?? null;
     instanceName = lastJobs[0]?.instance_name ?? null;
     userId = userId ?? (lastJobs[0]?.user_id ?? null);
   }
 
-  // 3) Se ainda assim não conseguiu, tenta cair só pela conexão (sem fluxo/remote)
   if (!instanceId && !instanceName) {
-    const { data: lastByConn, error: err2 } = await supa
+    const { data: lastByConn } = await supa
       .from('fluxo_agendamentos')
       .select('instance_id, instance_name, user_id')
       .eq('whatsapp_conexao_id', wait.whatsapp_conexao_id)
       .order('created_at', { ascending: false })
       .limit(1);
 
-    if (!err2 && lastByConn?.length) {
+    if (lastByConn?.length) {
       instanceId = lastByConn[0]?.instance_id ?? null;
       instanceName = lastByConn[0]?.instance_name ?? null;
       userId = userId ?? (lastByConn[0]?.user_id ?? null);
@@ -645,10 +875,8 @@ async function resolveInstanceAndUserForWait(wait: any): Promise<{
   return { instanceId, instanceName, userId };
 }
 
-
 async function processExpiredWait(wait: any) {
   try {
-    // Resolve instância e user sem depender de whatsapp_conexoes
     const { instanceId, instanceName, userId } = await resolveInstanceAndUserForWait(wait);
 
     if (!instanceId && !instanceName) {
@@ -658,46 +886,29 @@ async function processExpiredWait(wait: any) {
         fluxo: wait.fluxo_id,
         remote_jid: wait.remote_jid,
       });
-      // Sem instância não tem o que fazer — mantemos como "expired" (ou você pode marcar como "failed" se possuir essa coluna)
       return;
     }
 
-   
-
-    // 2) continuar o fluxo pelo no_reply_target_id
     const startId: string | null = wait.no_reply_target_id || null;
-    if (!startId) return; // nada a seguir
+    if (!startId) return;
 
-    // carrega grafo do fluxo
     const [{ data: nodes }, { data: edges }] = await Promise.all([
-      supa
-        .from('fluxo_nos')
-        .select('id, fluxo_id, tipo, conteudo, ordem')
-        .eq('fluxo_id', wait.fluxo_id),
-      supa
-        .from('fluxo_edge')
-        .select('id, fluxo_id, source, target, data')
-        .eq('fluxo_id', wait.fluxo_id),
+      supa.from('fluxo_nos').select('id, fluxo_id, tipo, conteudo, ordem').eq('fluxo_id', wait.fluxo_id),
+      supa.from('fluxo_edge').select('id, fluxo_id, source, target, data').eq('fluxo_id', wait.fluxo_id),
     ]);
     if (!nodes?.length) return;
 
-    const actions = planSendsForContinuation(
-      nodes as unknown as DbNode[],
-      edges as unknown as DbEdge[],
-      startId
-    );
-    if (!actions.length) return;
+    const plan = planSends(nodes as DbNode[], edges as DbEdge[], startId)
 
-    // enfileira todas as ações com a instância resolvida
-    for (const a of actions) {
+    // enfileira ações da continuação
+    for (const a of plan.actions) {
       if (a.kind === 'presence') {
         await enqueueJob({
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
           remoteJid: wait.remote_jid,
-          instanceId,
-          instanceName,
+          instanceId, instanceName,
           actionKind: 'presence',
           payload: { state: a.state, durationMs: a.durationMs ?? 3000 },
           delayMs: a.delayMs,
@@ -708,8 +919,7 @@ async function processExpiredWait(wait: any) {
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
           remoteJid: wait.remote_jid,
-          instanceId,
-          instanceName,
+          instanceId, instanceName,
           actionKind: 'text',
           payload: { text: a.text },
           delayMs: a.delayMs,
@@ -720,8 +930,7 @@ async function processExpiredWait(wait: any) {
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
           remoteJid: wait.remote_jid,
-          instanceId,
-          instanceName,
+          instanceId, instanceName,
           actionKind: 'image',
           payload: { media: a.urlOrBase64, caption: a.caption ?? null },
           delayMs: a.delayMs,
@@ -732,8 +941,7 @@ async function processExpiredWait(wait: any) {
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
           remoteJid: wait.remote_jid,
-          instanceId,
-          instanceName,
+          instanceId, instanceName,
           actionKind: 'audio',
           payload: { media: a.urlOrBase64 },
           delayMs: a.delayMs,
@@ -744,20 +952,28 @@ async function processExpiredWait(wait: any) {
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
           remoteJid: wait.remote_jid,
-          instanceId,
-          instanceName,
+          instanceId, instanceName,
           actionKind: 'notify',
           payload: { number: a.number, text: a.text },
+          delayMs: a.delayMs,
+        });
+      } else if (a.kind === 'next_flow') {
+        await enqueueJob({
+          conexaoId: wait.whatsapp_conexao_id,
+          fluxoId: a.targetFluxoId,
+          userId: userId ?? null,
+          remoteJid: wait.remote_jid,
+          instanceId, instanceName,
+          actionKind: 'start_flow',
+          payload: { targetFluxoId: a.targetFluxoId },
           delayMs: a.delayMs,
         });
       }
     }
   } catch (e) {
     console.error('[worker][processExpiredWait] error', e);
-    // Mantemos a linha como "expired" (já marcada no claim). Se você possuir coluna de erro, pode atualizar aqui.
   }
 }
-
 
 /* =========================
    LOOP
@@ -770,7 +986,7 @@ async function loop() {
       await processExpiredWait(w);
     }
 
-    // 2) processa jobs normais (fila de envios)
+    // 2) processa jobs normais (fila de envios + start_flow)
     const jobs = await claimJobs(10);
     for (const j of jobs) await processJob(j);
   } catch (e) {
