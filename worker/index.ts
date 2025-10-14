@@ -24,7 +24,7 @@ const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 const WORKER_ID = `worker-${Math.random().toString(36).slice(2, 6)}`
 
 /* =========================
-   EVO HELPERS
+   NORMALIZAÇÃO / KEYS
    ========================= */
 function normalizeNumber(input?: string | null): string {
   if (!input) return ''
@@ -32,6 +32,24 @@ function normalizeNumber(input?: string | null): string {
   return base.replace(/[^\d]/g, '').trim()
 }
 
+function makeIdempotencyKey(
+  sessionId: string,
+  flowId: string | null,
+  kind: string,
+  payload: Record<string, unknown>,
+  dueAtIso: string
+): string {
+  const raw = JSON.stringify({ sessionId, flowId, kind, payload, dueAtIso })
+  // hash curto para não estourar índice
+  const h = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24)
+  return `${sessionId}:${flowId ?? 'noflow'}:${kind}:${h}`
+}
+
+import crypto from 'crypto'
+
+/* =========================
+   EVO HELPERS
+   ========================= */
 async function evoPostRaw(path: string, body: Record<string, unknown>) {
   const url = `${EVO_BASE}${path}`
   return fetch(url, {
@@ -85,34 +103,40 @@ async function enqueueJob(params: {
   conexaoId: string;
   fluxoId: string | null;
   userId: string | null;
-  remoteJid: string;
+  remoteJid: string;          // já normalizado
   instanceId?: string | null;
   instanceName?: string | null;
   actionKind: QueueActionKind;
   payload: Record<string, unknown>;
+  sessionId: string;
   delayMs?: number; // default 0
 }) {
   const {
     conexaoId, fluxoId, userId, remoteJid,
-    instanceId, instanceName, actionKind, payload, delayMs = 0
-  } = params;
+    instanceId, instanceName, actionKind, payload, delayMs = 0, sessionId
+  } = params
 
-  const dueAt = new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+  const dueAtIso = new Date(Date.now() + Math.max(0, delayMs)).toISOString()
+  const idem = makeIdempotencyKey(sessionId, fluxoId, actionKind, payload, dueAtIso)
 
-  const { error } = await supa.from('fluxo_agendamentos').insert({
-    user_id: userId,
-    whatsapp_conexao_id: conexaoId,
-    fluxo_id: fluxoId,
-    remote_jid: remoteJid,
-    instance_id: instanceId ?? null,
-    instance_name: instanceName ?? null,
-    action_kind: actionKind,
-    payload,
-    due_at: dueAt,
-    status: 'pending',
-  });
+  const { error } = await supa
+    .from('fluxo_agendamentos')
+    .upsert([{
+      user_id: userId,
+      whatsapp_conexao_id: conexaoId,
+      fluxo_id: fluxoId,
+      remote_jid: remoteJid,
+      instance_id: instanceId ?? null,
+      instance_name: instanceName ?? null,
+      action_kind: actionKind,
+      payload,
+      due_at: dueAtIso,
+      status: 'pending',
+      session_id: sessionId,
+      idempotency_key: idem,
+    }], { onConflict: 'idempotency_key' })
 
-  if (error) throw error;
+  if (error) throw error
 }
 
 /* =========================
@@ -203,6 +227,7 @@ async function evoSend(
     const base = { number: num, ...(payload.delay ? { delay: payload.delay } : {}) }
     const { filename, mimetype } = inferFilenameAndMime(media)
 
+    // tentativas com diferentes rotas
     {
       const r0 = await evoPostRaw(`/message/sendWhatsAppAudio/${instance}`, {
         number: num,
@@ -276,6 +301,7 @@ async function evoSend(
 
 /* =========================
    MINI PLANNERS / TYPES
+   (mantidos da sua versão)
    ========================= */
 type DbNode = {
   id: string;
@@ -420,24 +446,9 @@ function planSendsForContinuation(nodes: DbNode[], edges: DbEdge[], startNodeId:
   return actions;
 }
 
-/* ===== Planner início (para start_flow) ===== */
-type StartPlanResult = {
-  actions: PlannedAction[];
-  aguarde?: {
-    nodeId: string;
-    timeoutSeconds: number;
-    followupText: string;
-    answeredTargetId: string | null;
-    noReplyTargetId: string | null;
-  };
-};
-
-function isAguardeNodeFull(n: DbNode) {
-  return n.tipo === 'aguarde_resposta';
-}
-function isNextFlowNodeFull(n: DbNode) {
-  return n.tipo === 'next_flow';
-}
+/* ===== Funções auxiliares do planner "start" ===== */
+function isAguardeNodeFull(n: DbNode) { return n.tipo === 'aguarde_resposta' }
+function isNextFlowNodeFull(n: DbNode) { return n.tipo === 'next_flow' }
 function parseAguardeFull(node: DbNode): { timeoutSeconds: number; followupText: string } {
   const c = (node.conteudo ?? {}) as { timeoutSeconds?: unknown; followupText?: unknown };
   const rawT = typeof c.timeoutSeconds === 'number' ? c.timeoutSeconds : Number(c.timeoutSeconds);
@@ -464,7 +475,7 @@ function getOutcomeTargetsFull(edges: DbEdge[], nodeId: string): { answered?: st
   return { answered: answered ?? null, no_reply: no_reply ?? null };
 }
 
-function planSendsForStart(nodes: DbNode[], edges: DbEdge[], startNodeId: string): StartPlanResult {
+function planSendsForStart(nodes: DbNode[], edges: DbEdge[], startNodeId: string) {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const MAX_STEPS = 20;
 
@@ -473,7 +484,15 @@ function planSendsForStart(nodes: DbNode[], edges: DbEdge[], startNodeId: string
   let elapsedMs = 0;
   let steps = 0;
   const visited = new Set<string>();
-  let aguardeInfo: StartPlanResult['aguarde'] | undefined;
+  let aguardeInfo:
+    | {
+        nodeId: string;
+        timeoutSeconds: number;
+        followupText: string;
+        answeredTargetId: string | null;
+        noReplyTargetId: string | null;
+      }
+    | undefined;
 
   while (curr && steps < MAX_STEPS) {
     if (visited.has(curr.id)) break;
@@ -550,11 +569,14 @@ type JobActionKind =
   | 'notify'
   | 'start_flow'
 
-async function claimJobs(limit = 10) {
+// Reivindica jobs vencidos, no máx. 1 por sessão (evita paralelismo por sessão)
+// Estratégia sem RPC: tentamos 'lockar' e, antes de processar, checamos corrida por sessão.
+async function claimJobs(limit = 20) {
   const nowIso = new Date().toISOString()
+
   const { data: candidates, error } = await supa
     .from('fluxo_agendamentos')
-    .select('id')
+    .select('id, session_id, due_at')
     .eq('status', 'pending')
     .lte('due_at', nowIso)
     .order('due_at', { ascending: true })
@@ -566,8 +588,15 @@ async function claimJobs(limit = 10) {
   }
   if (!candidates?.length) return []
 
+  const seenSessions = new Set<string>()
   const claimed: any[] = []
+
   for (const c of candidates) {
+    if (c.session_id && seenSessions.has(c.session_id)) {
+      // já vamos evitar pegar dois da mesma sessão no mesmo loop
+      continue
+    }
+
     const { data: updated, error: upErr } = await supa
       .from('fluxo_agendamentos')
       .update({ status: 'running', locked_at: new Date().toISOString(), locked_by: WORKER_ID })
@@ -580,17 +609,58 @@ async function claimJobs(limit = 10) {
       console.error('[worker][claimJobs] update error', upErr)
       continue
     }
-    if (updated) claimed.push(updated)
+    if (updated) {
+      claimed.push(updated)
+      if (updated.session_id) seenSessions.add(updated.session_id)
+    }
   }
   return claimed
 }
 
+/* =========================
+   PROCESSAMENTO DE JOB
+   ========================= */
+async function ensureSingleRunnerPerSession(job: any): Promise<boolean> {
+  // se existe outro 'running' da mesma sessão com id diferente → reagenda este
+  if (!job.session_id) return true
+  const { data: running, error } = await supa
+    .from('fluxo_agendamentos')
+    .select('id')
+    .eq('session_id', job.session_id)
+    .eq('status', 'running')
+    .neq('id', job.id)
+    .limit(1)
+
+  if (error) {
+    console.error('[worker][ensureSingleRunnerPerSession] error', error)
+    return true // não bloquear por erro de leitura
+  }
+  if (running && running.length > 0) {
+    // Reagenda este job 3s à frente
+    const next = new Date(Date.now() + 3000).toISOString()
+    await supa.from('fluxo_agendamentos')
+      .update({
+        status: 'pending',
+        due_at: next,
+        locked_at: null,
+        locked_by: null,
+      })
+      .eq('id', job.id)
+    return false
+  }
+  return true
+}
+
 async function processJob(job: any) {
   try {
+    // Garantia suave: 1 por sessão
+    const okToRun = await ensureSingleRunnerPerSession(job)
+    if (!okToRun) return
+
     const payload =
       typeof job.payload === 'string' ? JSON.parse(job.payload) : (job.payload || {})
 
-    // ===== NOVO: tratar start_flow =====
+    // ===== start_flow =====
     if (job.action_kind === 'start_flow') {
       const target = typeof payload?.targetFluxoId === 'string' ? payload.targetFluxoId.trim() : ''
       const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)
@@ -638,25 +708,27 @@ async function processJob(job: any) {
           expires_at: expires.toISOString(),
           fluxo_id: target,
           node_id: plan.aguarde.nodeId,
-          remote_jid: job.remote_jid,
+          remote_jid: normalizeNumber(job.remote_jid),
           whatsapp_conexao_id: job.whatsapp_conexao_id,
           user_id: (job.user_id ?? conn?.user_id) ?? null,
           answered_target_id: plan.aguarde.answeredTargetId,
           no_reply_target_id: plan.aguarde.noReplyTargetId,
           followup_text: plan.aguarde.followupText ? { text: plan.aguarde.followupText } : null,
+          session_id: job.session_id ?? null,
         })
       }
 
-      // enfileira ações do plano
+      // enfileira ações do plano (herdando session e idempotência)
       for (const a of plan.actions) {
         if (a.kind === 'presence') {
           await enqueueJob({
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: target,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'presence',
             payload: { state: a.state, durationMs: a.durationMs ?? 3000 },
             delayMs: a.delayMs,
@@ -666,9 +738,10 @@ async function processJob(job: any) {
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: target,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'text',
             payload: { text: a.text },
             delayMs: a.delayMs,
@@ -678,9 +751,10 @@ async function processJob(job: any) {
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: target,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'image',
             payload: { media: a.urlOrBase64, caption: a.caption ?? null },
             delayMs: a.delayMs,
@@ -690,9 +764,10 @@ async function processJob(job: any) {
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: target,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'audio',
             payload: { media: a.urlOrBase64 },
             delayMs: a.delayMs,
@@ -702,9 +777,10 @@ async function processJob(job: any) {
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: target,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'notify',
             payload: { number: a.number, text: a.text },
             delayMs: a.delayMs,
@@ -715,9 +791,10 @@ async function processJob(job: any) {
             conexaoId: job.whatsapp_conexao_id,
             fluxoId: a.targetFluxoId,
             userId: job.user_id ?? null,
-            remoteJid: job.remote_jid,
+            remoteJid: normalizeNumber(job.remote_jid),
             instanceId: job.instance_id ?? null,
             instanceName: job.instance_name ?? null,
+            sessionId: job.session_id ?? null,
             actionKind: 'start_flow',
             payload: { targetFluxoId: a.targetFluxoId },
             delayMs: a.delayMs,
@@ -767,6 +844,7 @@ async function processJob(job: any) {
       direcao: 'enviada',
       conteudo: job.action_kind === 'notify' ? { notify: true, text: (payload as any).text } : payload,
       timestamp: new Date().toISOString(),
+      session_id: job.session_id ?? null,
     })
 
     await supa
@@ -872,7 +950,7 @@ async function resolveInstanceAndUserForWait(wait: any): Promise<{
     .from('fluxo_agendamentos')
     .select('instance_id, instance_name, user_id')
     .eq('whatsapp_conexao_id', wait.whatsapp_conexao_id)
-    .eq('remote_jid', wait.remote_jid)
+    .eq('remote_jid', normalizeNumber(wait.remote_jid))
     .eq('fluxo_id', wait.fluxo_id)
     .order('created_at', { ascending: false })
     .limit(1);
@@ -942,9 +1020,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'presence',
           payload: { state: a.state, durationMs: a.durationMs ?? 3000 },
           delayMs: a.delayMs,
@@ -954,9 +1033,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'text',
           payload: { text: a.text },
           delayMs: a.delayMs,
@@ -966,9 +1046,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'image',
           payload: { media: a.urlOrBase64, caption: a.caption ?? null },
           delayMs: a.delayMs,
@@ -978,9 +1059,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'audio',
           payload: { media: a.urlOrBase64 },
           delayMs: a.delayMs,
@@ -990,9 +1072,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: wait.fluxo_id ?? null,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'notify',
           payload: { number: a.number, text: a.text },
           delayMs: a.delayMs,
@@ -1002,9 +1085,10 @@ async function processExpiredWait(wait: any) {
           conexaoId: wait.whatsapp_conexao_id,
           fluxoId: a.targetFluxoId,
           userId: userId ?? null,
-          remoteJid: wait.remote_jid,
+          remoteJid: normalizeNumber(wait.remote_jid),
           instanceId,
           instanceName,
+          sessionId: wait.session_id ?? null,
           actionKind: 'start_flow',
           payload: { targetFluxoId: a.targetFluxoId },
           delayMs: a.delayMs,
@@ -1026,7 +1110,7 @@ async function loop() {
       await processExpiredWait(w);
     }
 
-    const jobs = await claimJobs(10);
+    const jobs = await claimJobs(20);
     for (const j of jobs) await processJob(j);
   } catch (e) {
     console.error('[worker][loop error]', e);
